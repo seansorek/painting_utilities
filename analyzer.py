@@ -1,5 +1,8 @@
 import io
+import json
 import math
+import struct
+import colorsys
 
 import matplotlib
 matplotlib.use("Agg")
@@ -107,6 +110,104 @@ def nearest_color_name(rgb: tuple[int, int, int]) -> str:
         if d < best_dist:
             best_dist, best = d, name
     return best
+
+
+def rgb_to_cmyk(r: int, g: int, b: int) -> tuple[int, int, int, int]:
+    r_, g_, b_ = r / 255.0, g / 255.0, b / 255.0
+    k = 1 - max(r_, g_, b_)
+    if k == 1.0:
+        return 0, 0, 0, 100
+    c = (1 - r_ - k) / (1 - k)
+    m = (1 - g_ - k) / (1 - k)
+    y = (1 - b_ - k) / (1 - k)
+    return round(c * 100), round(m * 100), round(y * 100), round(k * 100)
+
+
+def classify_palette_type(colors: np.ndarray, counts: np.ndarray) -> str:
+    saturated_hues = []
+    for rgb in colors:
+        h, s, v = colorsys.rgb_to_hsv(rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0)
+        if s >= 0.15 and v >= 0.10:
+            saturated_hues.append(h * 360)
+
+    if len(saturated_hues) < 2:
+        return "Monochromatic"
+
+    def _circ_dist(a, b):
+        d = abs(a - b) % 360
+        return d if d <= 180 else 360 - d
+
+    # Maximum pairwise angular spread
+    max_spread = max(_circ_dist(a, b) for i, a in enumerate(saturated_hues)
+                     for b in saturated_hues[i + 1:])
+
+    if max_spread < 30:
+        return "Monochromatic"
+    if max_spread < 60:
+        return "Analogous"
+
+    # Complementary: any pair ~180° apart
+    for i, a in enumerate(saturated_hues):
+        for b in saturated_hues[i + 1:]:
+            if abs(_circ_dist(a, b) - 180) <= 30:
+                # Split complementary: third color ~150° from one end
+                others = [h for h in saturated_hues if h != a and h != b]
+                for c in others:
+                    if abs(_circ_dist(a, c) - 150) <= 30 or abs(_circ_dist(b, c) - 150) <= 30:
+                        return "Split Complementary"
+                return "Complementary"
+
+    # Triadic: three colors each ~120° apart
+    hues = sorted(saturated_hues)
+    for i, a in enumerate(hues):
+        for b in hues[i + 1:]:
+            if abs(_circ_dist(a, b) - 120) <= 30:
+                for c in hues:
+                    if c != a and c != b:
+                        if abs(_circ_dist(b, c) - 120) <= 30 and abs(_circ_dist(a, c) - 120) <= 30:
+                            return "Triadic"
+
+    return "Polychromatic"
+
+
+def palette_to_gradient_stops(
+    colors: np.ndarray, counts: np.ndarray
+) -> list[tuple[float, int, int, int]]:
+    lums = np.array([0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] for c in colors])
+    order = np.argsort(lums)
+    sorted_colors = colors[order]
+    n = len(sorted_colors)
+    stops = []
+    for i, rgb in enumerate(sorted_colors):
+        pos = i / max(n - 1, 1)
+        stops.append((pos, int(rgb[0]), int(rgb[1]), int(rgb[2])))
+    return stops
+
+
+def export_ase(colors: list[tuple[int, int, int]], name: str = "Palette") -> bytes:
+    blocks = []
+    for i, (r, g, b) in enumerate(colors):
+        color_name = f"{name} {i + 1}"
+        name_utf16 = (color_name + "\x00").encode("utf-16-be")
+        name_len = len(name_utf16) // 2
+        block_data = struct.pack(">H", name_len)
+        block_data += name_utf16
+        block_data += b"RGB "
+        block_data += struct.pack(">fff", r / 255.0, g / 255.0, b / 255.0)
+        block_data += struct.pack(">H", 0)
+        blocks.append(struct.pack(">HI", 0x0001, len(block_data)) + block_data)
+    return b"ASEF" + struct.pack(">HHI", 1, 0, len(blocks)) + b"".join(blocks)
+
+
+def export_swatches(colors: list[tuple[int, int, int]], name: str = "Palette") -> bytes:
+    swatches = []
+    for r, g, b in colors:
+        h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        swatches.append({"hue": round(h, 6), "saturation": round(s, 6),
+                         "brightness": round(v, 6), "alpha": 1.0, "colorSpace": 0})
+    while len(swatches) < 30:
+        swatches.append(None)
+    return json.dumps({"name": name, "swatches": swatches}).encode("utf-8")
 
 
 def load_image_from_bytes(data: bytes) -> Image.Image:

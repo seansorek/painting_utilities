@@ -18,6 +18,11 @@ from analyzer import (
     GRADIENT_PRESETS,
     parse_hex_color,
     render_gradient_preview,
+    rgb_to_cmyk,
+    classify_palette_type,
+    palette_to_gradient_stops,
+    export_ase,
+    export_swatches,
 )
 
 load_dotenv()
@@ -49,12 +54,48 @@ def _hue_range_label(hue_range: tuple[int, int]) -> str:
     return f"{start}–{end}°"
 
 
+def _contrast_level(contrast: float) -> str:
+    if contrast < 30:
+        label = "Low"
+    elif contrast < 70:
+        label = "Medium"
+    else:
+        label = "High"
+    return f"{label} ({contrast})"
+
+
+def _saturation_level(sat_pct: float) -> str:
+    if sat_pct < 20:
+        label = "Low"
+    elif sat_pct < 60:
+        label = "Medium"
+    else:
+        label = "High"
+    return f"{label} ({sat_pct}%)"
+
+
+def _color_line(rgb, cnt, total, show_rgb: bool, show_cmyk: bool) -> str:
+    r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+    hex_str = f"#{r:02X}{g:02X}{b:02X}"
+    name = nearest_color_name((r, g, b))
+    pct = cnt / total * 100
+    line = f"`{hex_str}` **{name}** — {pct:.1f}%"
+    if show_rgb:
+        line += f"\n  RGB({r}, {g}, {b})"
+    if show_cmyk:
+        c, m, y, k = rgb_to_cmyk(r, g, b)
+        line += f"\n  CMYK({c}%, {m}%, {y}%, {k}%)"
+    return line
+
+
 def _build_stats_embed(
     stats: dict,
     colors,
     counts,
     image_name: str,
     grayscale_warning: bool,
+    show_rgb: bool = False,
+    show_cmyk: bool = False,
 ) -> discord.Embed:
     total = counts.sum()
     embed = discord.Embed(
@@ -65,18 +106,18 @@ def _build_stats_embed(
     )
     embed.add_field(name="Dimensions", value=f"{stats['width']} × {stats['height']} px", inline=True)
     embed.add_field(name="Brightness", value=f"{stats['brightness']} / 255", inline=True)
-    embed.add_field(name="Contrast", value=f"{stats['contrast']}", inline=True)
-    embed.add_field(name="Mean Saturation", value=f"{stats['mean_saturation_pct']}%", inline=True)
+    embed.add_field(name="Contrast", value=_contrast_level(stats["contrast"]), inline=True)
+    embed.add_field(name="Mean Saturation", value=_saturation_level(stats["mean_saturation_pct"]), inline=True)
     embed.add_field(
         name="Dominant Hue Range",
         value=_hue_range_label(stats["dominant_hue_range"]),
         inline=True,
     )
+    palette_type = classify_palette_type(colors, counts)
+    embed.add_field(name="Palette Type", value=palette_type, inline=True)
 
     top_colors_text = "\n".join(
-        f"`#{int(rgb[0]):02X}{int(rgb[1]):02X}{int(rgb[2]):02X}` "
-        f"**{nearest_color_name(tuple(int(v) for v in rgb))}** "
-        f"— {cnt / total * 100:.1f}%"
+        _color_line(rgb, cnt, total, show_rgb, show_cmyk)
         for rgb, cnt in zip(colors[:5], counts[:5])
     )
     embed.add_field(name="Top Colors", value=top_colors_text, inline=False)
@@ -102,10 +143,22 @@ async def analyze(
     image: discord.Option(discord.Attachment, description="Upload a painting image"),
     num_colors: discord.Option(
         int,
-        description="Number of dominant colors to extract (default 8)",
-        default=8,
+        description="Number of dominant colors to extract (default 10)",
+        default=10,
         min_value=3,
         max_value=16,
+    ),
+    show_rgb: discord.Option(
+        bool,
+        description="Show RGB values for each color",
+        default=False,
+        required=False,
+    ),
+    show_cmyk: discord.Option(
+        bool,
+        description="Show CMYK values for each color",
+        default=False,
+        required=False,
     ),
 ):
     await ctx.defer()
@@ -129,7 +182,7 @@ async def analyze(
         palette_buf = render_chart_to_bytesio(render_palette_chart(colors, counts))
         hue_sat_buf = render_chart_to_bytesio(render_hue_saturation_chart(img))
 
-        embed = _build_stats_embed(stats, colors, counts, image.filename, grayscale_warning)
+        embed = _build_stats_embed(stats, colors, counts, image.filename, grayscale_warning, show_rgb, show_cmyk)
 
         await ctx.followup.send(
             embed=embed,
@@ -153,10 +206,22 @@ async def palette(
     image: discord.Option(discord.Attachment, description="Upload a painting image"),
     num_colors: discord.Option(
         int,
-        description="Number of dominant colors to extract (default 8)",
-        default=8,
+        description="Number of dominant colors to extract (default 10)",
+        default=10,
         min_value=3,
         max_value=16,
+    ),
+    show_rgb: discord.Option(
+        bool,
+        description="Show RGB values for each color",
+        default=False,
+        required=False,
+    ),
+    show_cmyk: discord.Option(
+        bool,
+        description="Show CMYK values for each color",
+        default=False,
+        required=False,
     ),
 ):
     await ctx.defer()
@@ -177,8 +242,7 @@ async def palette(
 
         total = counts.sum()
         lines = [
-            f"`#{int(rgb[0]):02X}{int(rgb[1]):02X}{int(rgb[2]):02X}` "
-            f"**{nearest_color_name(tuple(int(v) for v in rgb))}** — {cnt / total * 100:.1f}%"
+            _color_line(rgb, cnt, total, show_rgb, show_cmyk)
             for rgb, cnt in zip(colors, counts)
         ]
         embed = discord.Embed(
@@ -298,6 +362,143 @@ async def gradient_map_cmd(
     except Exception:
         traceback.print_exc()
         await ctx.followup.send("Something went wrong processing the image.")
+
+
+@bot.slash_command(
+    name="palette_gradient",
+    description="Generate a gradient from the image's own colors and apply it as a tone map",
+    guild_ids=guild_ids,
+)
+async def palette_gradient_cmd(
+    ctx: discord.ApplicationContext,
+    image: discord.Option(discord.Attachment, description="Image to process", required=True),
+    num_colors: discord.Option(
+        int,
+        description="Number of colors to extract for the gradient (default 5)",
+        default=5,
+        min_value=3,
+        max_value=10,
+    ),
+):
+    await ctx.defer()
+
+    if not image.content_type or not image.content_type.startswith("image/"):
+        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+        return
+
+    if image.size > MAX_FILE_BYTES:
+        await ctx.followup.send(f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB.")
+        return
+
+    try:
+        data = await image.read()
+        img = load_image_from_bytes(data)
+        colors, counts = extract_dominant_colors(img, n=num_colors)
+        gradient_stops = palette_to_gradient_stops(colors, counts)
+
+        result = apply_gradient_map(img, gradient_stops)
+        out_buf = io.BytesIO()
+        result.save(out_buf, format="PNG")
+        out_buf.seek(0)
+
+        swatch_buf = render_gradient_preview(gradient_stops)
+
+        stop_colors = " → ".join(
+            f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in gradient_stops
+        )
+        embed = discord.Embed(
+            title=f"Palette Gradient — {image.filename}",
+            color=discord.Color.from_rgb(*[int(v) for v in colors[0]]),
+        )
+        embed.add_field(name="Gradient", value=stop_colors, inline=False)
+        embed.add_field(name="Dimensions", value=f"{img.width} × {img.height} px", inline=True)
+        embed.set_image(url="attachment://gradient_map.png")
+        embed.set_thumbnail(url="attachment://gradient_swatch.png")
+
+        await ctx.followup.send(
+            embed=embed,
+            files=[
+                discord.File(out_buf, filename="gradient_map.png"),
+                discord.File(swatch_buf, filename="gradient_swatch.png"),
+            ],
+        )
+    except Exception:
+        traceback.print_exc()
+        await ctx.followup.send("Something went wrong processing the image.")
+
+
+@bot.slash_command(
+    name="export_palette",
+    description="Export dominant colors as an .ase (Photoshop) or .swatches (Procreate) file",
+    guild_ids=guild_ids,
+)
+async def export_palette_cmd(
+    ctx: discord.ApplicationContext,
+    image: discord.Option(discord.Attachment, description="Image to extract colors from", required=True),
+    format: discord.Option(
+        str,
+        description="Export format",
+        choices=["ase", "swatches"],
+        default="ase",
+    ),
+    num_colors: discord.Option(
+        int,
+        description="Number of colors to extract (default 10)",
+        default=10,
+        min_value=3,
+        max_value=16,
+    ),
+    palette_name: discord.Option(
+        str,
+        description="Name for the palette (default: Palette)",
+        default="Palette",
+        required=False,
+    ),
+):
+    await ctx.defer()
+
+    if not image.content_type or not image.content_type.startswith("image/"):
+        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+        return
+
+    if image.size > MAX_FILE_BYTES:
+        await ctx.followup.send(f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB.")
+        return
+
+    try:
+        data = await image.read()
+        img = load_image_from_bytes(data)
+        colors, counts = extract_dominant_colors(img, n=num_colors)
+
+        color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
+
+        if format == "ase":
+            file_bytes = export_ase(color_list, palette_name)
+            filename = "palette.ase"
+        else:
+            file_bytes = export_swatches(color_list, palette_name)
+            filename = "palette.swatches"
+
+        total = counts.sum()
+        lines = [
+            f"`#{r:02X}{g:02X}{b:02X}` **{nearest_color_name((r, g, b))}** — {cnt / total * 100:.1f}%"
+            for (r, g, b), cnt in zip(color_list, counts)
+        ]
+        embed = discord.Embed(
+            title=f"Palette Export — {image.filename}",
+            description="\n".join(lines),
+            color=discord.Color.from_rgb(*color_list[0]),
+        )
+        embed.add_field(name="Format", value=f".{format}", inline=True)
+        embed.add_field(name="Colors", value=str(num_colors), inline=True)
+
+        await ctx.followup.send(
+            embed=embed,
+            files=[discord.File(io.BytesIO(file_bytes), filename=filename)],
+        )
+    except Exception:
+        traceback.print_exc()
+        await ctx.followup.send("Something went wrong exporting the palette.")
 
 
 if __name__ == "__main__":
