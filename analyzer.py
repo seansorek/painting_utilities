@@ -34,6 +34,71 @@ _NAMED_COLORS = [
 ]
 
 
+GRADIENT_PRESETS: dict[str, list[tuple[float, int, int, int]]] = {
+    "fire":      [(0.0,   0,   0,   0), (0.33, 180,  30,   0), (0.66, 255, 160,   0), (1.0, 255, 255, 180)],
+    "ocean":     [(0.0,   0,   0,  40), (0.4,    0,  60, 130), (0.75,   0, 160, 200), (1.0, 200, 240, 255)],
+    "forest":    [(0.0,   5,  20,   5), (0.35,  20,  80,  20), (0.7,   80, 160,  40), (1.0, 200, 230, 140)],
+    "amethyst":  [(0.0,  10,   0,  20), (0.4,   80,   0, 150), (0.75, 180,  80, 220), (1.0, 240, 200, 255)],
+    "grayscale": [(0.0,   0,   0,   0), (1.0,  255, 255, 255)],
+    "sunset":    [(0.0,  20,   0,  40), (0.3,  180,  30,  60), (0.65, 255, 130,  30), (1.0, 255, 220, 120)],
+    "ice":       [(0.0,   0,  10,  40), (0.45,  80, 160, 220), (0.8,  190, 230, 255), (1.0, 240, 250, 255)],
+}
+
+
+def parse_hex_color(hex_str: str) -> tuple[int, int, int]:
+    s = hex_str.strip().lstrip("#").upper()
+    if len(s) == 3:
+        s = s[0] * 2 + s[1] * 2 + s[2] * 2
+    if len(s) != 6:
+        raise ValueError(f"Invalid hex color '{hex_str}': must be #RGB or #RRGGBB")
+    try:
+        return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    except ValueError:
+        raise ValueError(f"Invalid hex color '{hex_str}': contains non-hex characters")
+
+
+def apply_gradient_map(
+    img: Image.Image,
+    gradient_stops: list[tuple[float, int, int, int]],
+) -> Image.Image:
+    stops = sorted(gradient_stops, key=lambda s: s[0])
+    lut_r = np.zeros(256, dtype=np.uint8)
+    lut_g = np.zeros(256, dtype=np.uint8)
+    lut_b = np.zeros(256, dtype=np.uint8)
+    n = len(stops)
+    for i in range(256):
+        t = i / 255.0
+        for k in range(n - 1):
+            pos0, r0, g0, b0 = stops[k]
+            pos1, r1, g1, b1 = stops[k + 1]
+            if t <= pos1 or k == n - 2:
+                span = pos1 - pos0
+                local_t = 0.0 if span == 0 else max(0.0, min(1.0, (t - pos0) / span))
+                lut_r[i] = round(r0 + (r1 - r0) * local_t)
+                lut_g[i] = round(g0 + (g1 - g0) * local_t)
+                lut_b[i] = round(b0 + (b1 - b0) * local_t)
+                break
+    arr = np.array(img, dtype=np.float32)
+    lum = (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]).astype(np.uint8)
+    out = np.stack([lut_r[lum], lut_g[lum], lut_b[lum]], axis=-1)
+    return Image.fromarray(out, mode="RGB")
+
+
+def render_gradient_preview(
+    gradient_stops: list[tuple[float, int, int, int]],
+    width: int = 400,
+    height: int = 40,
+) -> io.BytesIO:
+    ramp = np.arange(256, dtype=np.uint8).reshape(1, 256)
+    ramp_rgb = np.stack([ramp, ramp, ramp], axis=-1)
+    ramp_img = Image.fromarray(ramp_rgb, mode="RGB")
+    preview = apply_gradient_map(ramp_img, gradient_stops).resize((width, height), Image.NEAREST)
+    buf = io.BytesIO()
+    preview.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
 def nearest_color_name(rgb: tuple[int, int, int]) -> str:
     r, g, b = rgb
     best, best_dist = _NAMED_COLORS[0][0], float("inf")

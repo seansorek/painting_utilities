@@ -4,6 +4,8 @@ import traceback
 import discord
 from dotenv import load_dotenv
 
+import io
+
 from analyzer import (
     load_image_from_bytes,
     extract_dominant_colors,
@@ -12,6 +14,10 @@ from analyzer import (
     render_hue_saturation_chart,
     render_chart_to_bytesio,
     nearest_color_name,
+    apply_gradient_map,
+    GRADIENT_PRESETS,
+    parse_hex_color,
+    render_gradient_preview,
 )
 
 load_dotenv()
@@ -191,6 +197,107 @@ async def palette(
     except Exception:
         traceback.print_exc()
         await ctx.followup.send("Something went wrong. Make sure it's a valid image file.")
+
+
+def _build_gradient_embed(
+    filename: str,
+    gradient_label: str,
+    img,
+    gradient_stops: list,
+) -> discord.Embed:
+    _, r0, g0, b0 = gradient_stops[0]
+    _, r1, g1, b1 = gradient_stops[-1]
+    mid_r, mid_g, mid_b = (r0 + r1) // 2, (g0 + g1) // 2, (b0 + b1) // 2
+    embed = discord.Embed(
+        title=f"Gradient Map — {filename}",
+        color=discord.Color.from_rgb(mid_r, mid_g, mid_b),
+    )
+    embed.add_field(name="Gradient", value=gradient_label, inline=True)
+    embed.add_field(name="Dimensions", value=f"{img.width} × {img.height} px", inline=True)
+    embed.set_image(url="attachment://gradient_map.png")
+    embed.set_thumbnail(url="attachment://gradient_swatch.png")
+    return embed
+
+
+@bot.slash_command(
+    name="gradient_map",
+    description="Remap image tones through a color gradient",
+    guild_ids=guild_ids,
+)
+async def gradient_map_cmd(
+    ctx: discord.ApplicationContext,
+    image: discord.Option(discord.Attachment, description="Image to process", required=True),
+    preset: discord.Option(
+        str,
+        description="Predefined gradient (default: fire)",
+        choices=["fire", "ocean", "forest", "amethyst", "grayscale", "sunset", "ice"],
+        required=False,
+        default="fire",
+    ),
+    start_color: discord.Option(
+        str,
+        description="Custom shadow color as hex (e.g. #1a0030) — overrides preset if both given",
+        required=False,
+        default=None,
+    ),
+    end_color: discord.Option(
+        str,
+        description="Custom highlight color as hex (e.g. #ffe080) — overrides preset if both given",
+        required=False,
+        default=None,
+    ),
+):
+    await ctx.defer()
+
+    if not image.content_type or not image.content_type.startswith("image/"):
+        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+        return
+
+    if image.size > MAX_FILE_BYTES:
+        await ctx.followup.send(f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB.")
+        return
+
+    if (start_color is None) != (end_color is None):
+        await ctx.followup.send("Provide both `start_color` and `end_color`, or neither.")
+        return
+
+    gradient_stops = None
+    gradient_label = preset
+
+    if start_color is not None:
+        try:
+            r0, g0, b0 = parse_hex_color(start_color)
+            r1, g1, b1 = parse_hex_color(end_color)
+        except ValueError as e:
+            await ctx.followup.send(str(e))
+            return
+        gradient_stops = [(0.0, r0, g0, b0), (1.0, r1, g1, b1)]
+        gradient_label = f"custom ({start_color.upper()} → {end_color.upper()})"
+    else:
+        gradient_stops = GRADIENT_PRESETS[preset]
+
+    try:
+        data = await image.read()
+        img = load_image_from_bytes(data)
+        result = apply_gradient_map(img, gradient_stops)
+
+        out_buf = io.BytesIO()
+        result.save(out_buf, format="PNG")
+        out_buf.seek(0)
+
+        swatch_buf = render_gradient_preview(gradient_stops)
+        embed = _build_gradient_embed(image.filename, gradient_label, img, gradient_stops)
+
+        await ctx.followup.send(
+            embed=embed,
+            files=[
+                discord.File(out_buf, filename="gradient_map.png"),
+                discord.File(swatch_buf, filename="gradient_swatch.png"),
+            ],
+        )
+    except Exception:
+        traceback.print_exc()
+        await ctx.followup.send("Something went wrong processing the image.")
 
 
 if __name__ == "__main__":
