@@ -5,3 +5,6 @@ __pycache__/
 *.pyd
 .venv/
 venv/
+.claude/settings.local.json
+.claude/
+.claude/*
