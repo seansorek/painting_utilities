@@ -501,6 +501,124 @@ async def export_palette_cmd(
         await ctx.followup.send("Something went wrong exporting the palette.")
 
 
+COMMAND_DOCS = {
+    "analyze": {
+        "summary": "Full analysis: dominant colors, image stats, and two charts",
+        "description": (
+            "Uploads a painting and runs a full analysis: extracts dominant colors via KMeans clustering, "
+            "computes image statistics (brightness, contrast, saturation, dominant hue range, palette type), "
+            "and generates two chart images — a color palette swatch and a hue/saturation distribution chart."
+        ),
+        "params": [
+            ("`image`", "required", "The painting to analyze (PNG, JPEG, etc., max 15 MB)"),
+            ("`num_colors`", "3–16, default 10", "How many dominant colors to extract"),
+            ("`show_rgb`", "true/false, default false", "Include RGB values alongside each color"),
+            ("`show_cmyk`", "true/false, default false", "Include CMYK values alongside each color"),
+        ],
+        "output": "Embed with stats + top 5 colors, attached `palette.png` swatch chart and `hue_sat.png` distribution chart",
+    },
+    "palette": {
+        "summary": "Quick color palette swatch — no stats, just colors",
+        "description": (
+            "Extracts dominant colors from the image and lists all of them with hex codes, color names, "
+            "and percentage coverage. Faster than /analyze when you only need the palette."
+        ),
+        "params": [
+            ("`image`", "required", "The painting to analyze (PNG, JPEG, etc., max 15 MB)"),
+            ("`num_colors`", "3–16, default 10", "How many dominant colors to extract"),
+            ("`show_rgb`", "true/false, default false", "Include RGB values alongside each color"),
+            ("`show_cmyk`", "true/false, default false", "Include CMYK values alongside each color"),
+        ],
+        "output": "Embed listing all colors with hex/name/%, attached `palette.png` swatch chart",
+    },
+    "gradient_map": {
+        "summary": "Remap image tones through a color gradient",
+        "description": (
+            "Applies a gradient map to the image — each pixel's luminance value is remapped to a color "
+            "from the chosen gradient, replacing the original colors while preserving light/dark structure. "
+            "Choose a preset or supply custom shadow/highlight hex colors."
+        ),
+        "params": [
+            ("`image`", "required", "Image to process (PNG, JPEG, etc., max 15 MB)"),
+            ("`preset`", "fire/ocean/forest/amethyst/grayscale/sunset/ice, default fire", "Built-in gradient preset"),
+            ("`start_color`", "hex, e.g. `#1a0030`, optional", "Custom shadow (darkest) color — must be paired with `end_color`"),
+            ("`end_color`", "hex, e.g. `#ffe080`, optional", "Custom highlight (lightest) color — must be paired with `start_color`"),
+        ],
+        "output": "Embed with gradient label and dimensions, attached `gradient_map.png` result and `gradient_swatch.png` preview",
+    },
+    "palette_gradient": {
+        "summary": "Auto-generate a gradient from the image's own colors and apply it",
+        "description": (
+            "Extracts the dominant colors from the image, orders them by luminance to form gradient stops, "
+            "then applies that gradient as a tone map back onto the image. No preset needed — the gradient "
+            "is derived entirely from the image itself."
+        ),
+        "params": [
+            ("`image`", "required", "Image to process (PNG, JPEG, etc., max 15 MB)"),
+            ("`num_colors`", "3–10, default 5", "Number of colors to extract for the gradient"),
+        ],
+        "output": "Embed with gradient hex stops and dimensions, attached `gradient_map.png` result and `gradient_swatch.png` preview",
+    },
+    "export_palette": {
+        "summary": "Export colors as an .ase (Photoshop) or .swatches (Procreate) file",
+        "description": (
+            "Extracts dominant colors and exports them as a palette file compatible with design software. "
+            "`ase` produces an Adobe Swatch Exchange file importable in Photoshop, Illustrator, and InDesign. "
+            "`swatches` produces a JSON-based file importable directly in Procreate."
+        ),
+        "params": [
+            ("`image`", "required", "Image to extract colors from (PNG, JPEG, etc., max 15 MB)"),
+            ("`format`", "ase/swatches, default ase", "Export format: `.ase` for Adobe apps or `.swatches` for Procreate"),
+            ("`num_colors`", "3–16, default 10", "Number of colors to extract"),
+            ("`palette_name`", "text, default `Palette`", "Name embedded in the palette file"),
+        ],
+        "output": "Embed listing all colors, attached `palette.ase` or `palette.swatches` file for download",
+    },
+}
+
+_HELP_CHOICES = list(COMMAND_DOCS.keys())
+
+
+@bot.slash_command(
+    name="help",
+    description="Show available commands and how to use them",
+    guild_ids=guild_ids,
+)
+async def help_cmd(
+    ctx: discord.ApplicationContext,
+    command: discord.Option(
+        str,
+        description="Get detailed help for a specific command",
+        choices=_HELP_CHOICES,
+        required=False,
+        default=None,
+    ),
+):
+    if command is None:
+        embed = discord.Embed(
+            title="Painting Utilities — Commands",
+            description="Tools for analyzing painting images and extracting color palettes.",
+            color=discord.Color.blurple(),
+        )
+        for name, doc in COMMAND_DOCS.items():
+            embed.add_field(name=f"/{name}", value=doc["summary"], inline=False)
+        embed.set_footer(text="Use /help command:<name> for detailed usage and parameters.")
+        await ctx.respond(embed=embed)
+    else:
+        doc = COMMAND_DOCS[command]
+        embed = discord.Embed(
+            title=f"/{command}",
+            description=doc["description"],
+            color=discord.Color.blurple(),
+        )
+        param_lines = "\n".join(
+            f"**{p}** ({default}) — {desc}" for p, default, desc in doc["params"]
+        )
+        embed.add_field(name="Parameters", value=param_lines, inline=False)
+        embed.add_field(name="Output", value=doc["output"], inline=False)
+        await ctx.respond(embed=embed)
+
+
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN not set. Copy .env.example to .env and fill it in.")
