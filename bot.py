@@ -567,6 +567,8 @@ async def export_gradient_cmd(
             file_bytes = export_gradient_json(gradient_stops, name=gradient_name)
             filename = f"{gradient_name}.json"
 
+        swatch_buf = render_gradient_preview(gradient_stops)
+
         stop_colors = " → ".join(
             f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in gradient_stops
         )
@@ -578,10 +580,14 @@ async def export_gradient_cmd(
         embed.add_field(name="Format", value=f".{format}", inline=True)
         embed.add_field(name="Sorted by", value=sort_by.capitalize(), inline=True)
         embed.add_field(name="Colors", value=str(num_colors), inline=True)
+        embed.set_image(url="attachment://gradient_swatch.png")
 
         await ctx.followup.send(
             embed=embed,
-            files=[discord.File(io.BytesIO(file_bytes), filename=filename)],
+            files=[
+                discord.File(io.BytesIO(file_bytes), filename=filename),
+                discord.File(swatch_buf, filename="gradient_swatch.png"),
+            ],
         )
     except Exception:
         traceback.print_exc()
