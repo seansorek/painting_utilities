@@ -23,6 +23,8 @@ from analyzer import (
     palette_to_gradient_stops,
     export_ase,
     export_swatches,
+    export_gradient_ggr,
+    export_gradient_json,
 )
 
 load_dotenv()
@@ -379,6 +381,12 @@ async def palette_gradient_cmd(
         min_value=3,
         max_value=10,
     ),
+    sort_by: discord.Option(
+        str,
+        description="How to order colors in the gradient (default: value)",
+        choices=["value", "luminance", "hue", "saturation"],
+        default="value",
+    ),
 ):
     await ctx.defer()
 
@@ -394,7 +402,7 @@ async def palette_gradient_cmd(
         data = await image.read()
         img = load_image_from_bytes(data)
         colors, counts = extract_dominant_colors(img, n=num_colors)
-        gradient_stops = palette_to_gradient_stops(colors, counts)
+        gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
 
         result = apply_gradient_map(img, gradient_stops)
         out_buf = io.BytesIO()
@@ -411,6 +419,7 @@ async def palette_gradient_cmd(
             color=discord.Color.from_rgb(*[int(v) for v in colors[0]]),
         )
         embed.add_field(name="Gradient", value=stop_colors, inline=False)
+        embed.add_field(name="Sorted by", value=sort_by.capitalize(), inline=True)
         embed.add_field(name="Dimensions", value=f"{img.width} × {img.height} px", inline=True)
         embed.set_image(url="attachment://gradient_map.png")
         embed.set_thumbnail(url="attachment://gradient_swatch.png")
@@ -501,6 +510,84 @@ async def export_palette_cmd(
         await ctx.followup.send("Something went wrong exporting the palette.")
 
 
+@bot.slash_command(
+    name="export_gradient",
+    description="Export a palette-derived gradient as a .ggr (GIMP/Krita) or .json file",
+    guild_ids=guild_ids,
+)
+async def export_gradient_cmd(
+    ctx: discord.ApplicationContext,
+    image: discord.Option(discord.Attachment, description="Image to extract colors from", required=True),
+    format: discord.Option(
+        str,
+        description="Export format (default: ggr)",
+        choices=["ggr", "json"],
+        default="ggr",
+    ),
+    num_colors: discord.Option(
+        int,
+        description="Number of colors to extract (default 5)",
+        default=5,
+        min_value=3,
+        max_value=10,
+    ),
+    sort_by: discord.Option(
+        str,
+        description="How to order colors in the gradient (default: value)",
+        choices=["value", "luminance", "hue", "saturation"],
+        default="value",
+    ),
+    gradient_name: discord.Option(
+        str,
+        description="Name embedded in the gradient file (default: palette_gradient)",
+        default="palette_gradient",
+        required=False,
+    ),
+):
+    await ctx.defer()
+
+    if not image.content_type or not image.content_type.startswith("image/"):
+        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+        return
+
+    if image.size > MAX_FILE_BYTES:
+        await ctx.followup.send(f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB.")
+        return
+
+    try:
+        data = await image.read()
+        img = load_image_from_bytes(data)
+        colors, counts = extract_dominant_colors(img, n=num_colors)
+        gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
+
+        if format == "ggr":
+            file_bytes = export_gradient_ggr(gradient_stops, name=gradient_name)
+            filename = f"{gradient_name}.ggr"
+        else:
+            file_bytes = export_gradient_json(gradient_stops, name=gradient_name)
+            filename = f"{gradient_name}.json"
+
+        stop_colors = " → ".join(
+            f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in gradient_stops
+        )
+        embed = discord.Embed(
+            title=f"Gradient Export — {image.filename}",
+            color=discord.Color.from_rgb(*[int(v) for v in colors[0]]),
+        )
+        embed.add_field(name="Gradient", value=stop_colors, inline=False)
+        embed.add_field(name="Format", value=f".{format}", inline=True)
+        embed.add_field(name="Sorted by", value=sort_by.capitalize(), inline=True)
+        embed.add_field(name="Colors", value=str(num_colors), inline=True)
+
+        await ctx.followup.send(
+            embed=embed,
+            files=[discord.File(io.BytesIO(file_bytes), filename=filename)],
+        )
+    except Exception:
+        traceback.print_exc()
+        await ctx.followup.send("Something went wrong exporting the gradient.")
+
+
 COMMAND_DOCS = {
     "analyze": {
         "summary": "Full analysis: dominant colors, image stats, and two charts",
@@ -549,15 +636,19 @@ COMMAND_DOCS = {
     "palette_gradient": {
         "summary": "Auto-generate a gradient from the image's own colors and apply it",
         "description": (
-            "Extracts the dominant colors from the image, orders them by luminance to form gradient stops, "
-            "then applies that gradient as a tone map back onto the image. No preset needed — the gradient "
-            "is derived entirely from the image itself."
+            "Extracts the dominant colors from the image, orders them by the chosen sorting dimension "
+            "(HSV value, luminance, hue, or saturation) to form gradient stops, then applies that gradient "
+            "as a tone map back onto the image. No preset needed — the gradient is derived from the image itself. "
+            "To download the gradient as a file, use /export_gradient."
         ),
         "params": [
             ("`image`", "required", "Image to process (PNG, JPEG, etc., max 15 MB)"),
             ("`num_colors`", "3–10, default 5", "Number of colors to extract for the gradient"),
+            ("`sort_by`", "value/luminance/hue/saturation, default value",
+             "How to order colors: `value` = HSV brightness (max R/G/B), `luminance` = weighted Rec.601, "
+             "`hue` = color wheel angle, `saturation` = HSV saturation"),
         ],
-        "output": "Embed with gradient hex stops and dimensions, attached `gradient_map.png` result and `gradient_swatch.png` preview",
+        "output": "Embed with gradient hex stops, sort mode, and dimensions; attached `gradient_map.png` result and `gradient_swatch.png` preview",
     },
     "export_palette": {
         "summary": "Export colors as an .ase (Photoshop) or .swatches (Procreate) file",
@@ -573,6 +664,24 @@ COMMAND_DOCS = {
             ("`palette_name`", "text, default `Palette`", "Name embedded in the palette file"),
         ],
         "output": "Embed listing all colors, attached `palette.ase` or `palette.swatches` file for download",
+    },
+    "export_gradient": {
+        "summary": "Export a palette-derived gradient as a .ggr (GIMP/Krita) or .json file",
+        "description": (
+            "Extracts dominant colors from the image, sorts them into gradient stops by the chosen dimension, "
+            "and exports the result as a gradient file. `.ggr` is the GIMP Gradient format, importable in GIMP "
+            "and Krita. `.json` is a generic format suitable for custom tooling or web use. "
+            "No tone map is applied to the image — this command only produces the gradient definition file."
+        ),
+        "params": [
+            ("`image`", "required", "Image to extract colors from (PNG, JPEG, etc., max 15 MB)"),
+            ("`format`", "ggr/json, default ggr", "Export format: `.ggr` for GIMP/Krita, `.json` for generic use"),
+            ("`num_colors`", "3–10, default 5", "Number of colors to extract"),
+            ("`sort_by`", "value/luminance/hue/saturation, default value",
+             "Sorting dimension for the gradient stops"),
+            ("`gradient_name`", "text, default `palette_gradient`", "Name embedded in the exported file"),
+        ],
+        "output": "Embed listing the gradient stops and settings, attached `.ggr` or `.json` file for download",
     },
 }
 

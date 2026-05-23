@@ -4,7 +4,9 @@
       "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\sssor\\\\Documents\\\\painting_utilities\" -Recurse -Force)",
       "Bash(Select-Object FullName, PSIsContainer)",
       "Bash(Sort-Object FullName)",
-      "Bash(Get-ChildItem -Path 'c:\\\\Users\\\\sssor\\\\Documents\\\\painting_utilities' -Force)"
+      "Bash(Get-ChildItem -Path 'c:\\\\Users\\\\sssor\\\\Documents\\\\painting_utilities' -Force)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\sssor\\\\Documents\\\\painting_utilities\" -Recurse -Name)",
+      "Bash(Select-Object -First 30)"
     ]
   }
 }

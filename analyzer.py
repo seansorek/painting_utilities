@@ -171,17 +171,56 @@ def classify_palette_type(colors: np.ndarray, counts: np.ndarray) -> str:
 
 
 def palette_to_gradient_stops(
-    colors: np.ndarray, counts: np.ndarray
+    colors: np.ndarray, counts: np.ndarray, sort_by: str = "value"
 ) -> list[tuple[float, int, int, int]]:
-    lums = np.array([0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] for c in colors])
-    order = np.argsort(lums)
+    def _key(rgb):
+        r, g, b = rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0
+        h, s, v = colorsys.rgb_to_hsv(r, g, b)
+        if sort_by == "luminance":
+            return 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+        if sort_by == "hue":
+            return h
+        if sort_by == "saturation":
+            return s
+        return v  # default: "value"
+
+    order = np.argsort([_key(c) for c in colors])
     sorted_colors = colors[order]
     n = len(sorted_colors)
-    stops = []
-    for i, rgb in enumerate(sorted_colors):
-        pos = i / max(n - 1, 1)
-        stops.append((pos, int(rgb[0]), int(rgb[1]), int(rgb[2])))
-    return stops
+    return [
+        (i / max(n - 1, 1), int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        for i, rgb in enumerate(sorted_colors)
+    ]
+
+
+def export_gradient_ggr(
+    gradient_stops: list[tuple[float, int, int, int]],
+    name: str = "palette_gradient",
+) -> bytes:
+    stops = sorted(gradient_stops, key=lambda s: s[0])
+    n_segments = len(stops) - 1
+    lines = ["GIMP Gradient", f"Name: {name}", str(n_segments)]
+    for i in range(n_segments):
+        left_pos, r0, g0, b0 = stops[i]
+        right_pos, r1, g1, b1 = stops[i + 1]
+        mid = (left_pos + right_pos) / 2.0
+        lines.append(
+            f"{left_pos:.6f} {mid:.6f} {right_pos:.6f} "
+            f"{r0/255:.6f} {g0/255:.6f} {b0/255:.6f} 1.000000 "
+            f"{r1/255:.6f} {g1/255:.6f} {b1/255:.6f} 1.000000 0 0"
+        )
+    return "\n".join(lines).encode("utf-8")
+
+
+def export_gradient_json(
+    gradient_stops: list[tuple[float, int, int, int]],
+    name: str = "palette_gradient",
+) -> bytes:
+    stops_list = [
+        {"position": round(pos, 6), "r": r, "g": g, "b": b}
+        for pos, r, g, b in sorted(gradient_stops, key=lambda s: s[0])
+    ]
+    return json.dumps({"name": name, "stops": stops_list}, indent=2).encode("utf-8")
 
 
 def export_ase(colors: list[tuple[int, int, int]], name: str = "Palette") -> bytes:
