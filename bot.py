@@ -379,7 +379,7 @@ async def palette_gradient_cmd(
         description="Number of colors to extract for the gradient (default 5)",
         default=5,
         min_value=3,
-        max_value=10,
+        max_value=100,
     ),
     sort_by: discord.Option(
         str,
@@ -529,7 +529,7 @@ async def export_gradient_cmd(
         description="Number of colors to extract (default 5)",
         default=5,
         min_value=3,
-        max_value=10,
+        max_value=100,
     ),
     sort_by: discord.Option(
         str,
