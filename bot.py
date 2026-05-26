@@ -1,10 +1,10 @@
+import hashlib
+import io
 import os
 import traceback
 
 import discord
 from dotenv import load_dotenv
-
-import io
 
 from analyzer import (
     load_image_from_bytes,
@@ -17,12 +17,26 @@ from analyzer import (
     apply_gradient_map,
     GRADIENT_PRESETS,
     parse_hex_color,
+    parse_multi_hex_gradient,
+    reverse_gradient,
     render_gradient_preview,
     rgb_to_cmyk,
     classify_palette_type,
     palette_to_gradient_stops,
+    adjust_image,
+    simulate_colorblindness,
+    render_colorblind_comparison,
+    recolor_image,
+    suggest_harmony_colors,
+    render_harmony_chart,
+    render_color_info_swatch,
+    render_compare_chart,
     export_ase,
     export_swatches,
+    export_gpl,
+    export_aco,
+    export_css,
+    export_tailwind,
     export_gradient_ggr,
     export_gradient_json,
 )
@@ -36,10 +50,42 @@ MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 
 bot = discord.Bot(intents=discord.Intents.default())
 
+# ---------------------------------------------------------------------------
+# Result cache — keyed by (sha1(image_bytes), n_colors, sat_boost, bri_boost)
+# Stores (colors, counts, stats) so repeated uploads skip KMeans.
+# ---------------------------------------------------------------------------
+_IMAGE_CACHE: dict[str, tuple] = {}
+_CACHE_MAX = 50
+
+
+def _cache_key(data: bytes, n: int, sat: float = 0.0, bri: float = 0.0) -> str:
+    h = hashlib.sha1(data, usedforsecurity=False).hexdigest()
+    return f"{h}:{n}:{sat:.3f}:{bri:.3f}"
+
+
+def _cache_get(data: bytes, n: int, sat: float = 0.0, bri: float = 0.0):
+    return _IMAGE_CACHE.get(_cache_key(data, n, sat, bri))
+
+
+def _cache_set(data: bytes, n: int, sat: float, bri: float, colors, counts, stats):
+    key = _cache_key(data, n, sat, bri)
+    if len(_IMAGE_CACHE) >= _CACHE_MAX:
+        _IMAGE_CACHE.pop(next(iter(_IMAGE_CACHE)))
+    _IMAGE_CACHE[key] = (colors, counts, stats)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
 @bot.event
 async def on_ready():
     print(f"Ready — logged in as {bot.user} (id: {bot.user.id})")
+
+
+def _pct_bar(pct: float, width: int = 8) -> str:
+    filled = round(pct / 100 * width)
+    return "█" * filled + "░" * (width - filled)
 
 
 def _hue_range_label(hue_range: tuple[int, int]) -> str:
@@ -57,22 +103,12 @@ def _hue_range_label(hue_range: tuple[int, int]) -> str:
 
 
 def _contrast_level(contrast: float) -> str:
-    if contrast < 30:
-        label = "Low"
-    elif contrast < 70:
-        label = "Medium"
-    else:
-        label = "High"
+    label = "Low" if contrast < 30 else "Medium" if contrast < 70 else "High"
     return f"{label} ({contrast})"
 
 
 def _saturation_level(sat_pct: float) -> str:
-    if sat_pct < 20:
-        label = "Low"
-    elif sat_pct < 60:
-        label = "Medium"
-    else:
-        label = "High"
+    label = "Low" if sat_pct < 20 else "Medium" if sat_pct < 60 else "High"
     return f"{label} ({sat_pct}%)"
 
 
@@ -81,7 +117,8 @@ def _color_line(rgb, cnt, total, show_rgb: bool, show_cmyk: bool) -> str:
     hex_str = f"#{r:02X}{g:02X}{b:02X}"
     name = nearest_color_name((r, g, b))
     pct = cnt / total * 100
-    line = f"`{hex_str}` **{name}** — {pct:.1f}%"
+    bar = _pct_bar(pct)
+    line = f"`{hex_str}` **{name}** {bar} {pct:.1f}%"
     if show_rgb:
         line += f"\n  RGB({r}, {g}, {b})"
     if show_cmyk:
@@ -90,33 +127,33 @@ def _color_line(rgb, cnt, total, show_rgb: bool, show_cmyk: bool) -> str:
     return line
 
 
+async def _validate_image(ctx, image) -> bool:
+    if not image.content_type or not image.content_type.startswith("image/"):
+        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+        return False
+    if image.size > MAX_FILE_BYTES:
+        await ctx.followup.send(
+            f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB."
+        )
+        return False
+    return True
+
+
 def _build_stats_embed(
-    stats: dict,
-    colors,
-    counts,
-    image_name: str,
-    grayscale_warning: bool,
-    show_rgb: bool = False,
-    show_cmyk: bool = False,
+    stats: dict, colors, counts, image_name: str,
+    grayscale_warning: bool, show_rgb: bool = False, show_cmyk: bool = False,
 ) -> discord.Embed:
     total = counts.sum()
     embed = discord.Embed(
         title=f"Image Analysis — {image_name}",
-        color=discord.Color.from_rgb(
-            int(colors[0][0]), int(colors[0][1]), int(colors[0][2])
-        ),
+        color=discord.Color.from_rgb(int(colors[0][0]), int(colors[0][1]), int(colors[0][2])),
     )
-    embed.add_field(name="Dimensions", value=f"{stats['width']} × {stats['height']} px", inline=True)
-    embed.add_field(name="Brightness", value=f"{stats['brightness']} / 255", inline=True)
-    embed.add_field(name="Contrast", value=_contrast_level(stats["contrast"]), inline=True)
-    embed.add_field(name="Mean Saturation", value=_saturation_level(stats["mean_saturation_pct"]), inline=True)
-    embed.add_field(
-        name="Dominant Hue Range",
-        value=_hue_range_label(stats["dominant_hue_range"]),
-        inline=True,
-    )
-    palette_type = classify_palette_type(colors, counts)
-    embed.add_field(name="Palette Type", value=palette_type, inline=True)
+    embed.add_field(name="Dimensions",       value=f"{stats['width']} × {stats['height']} px", inline=True)
+    embed.add_field(name="Brightness",       value=f"{stats['brightness']} / 255",              inline=True)
+    embed.add_field(name="Contrast",         value=_contrast_level(stats["contrast"]),           inline=True)
+    embed.add_field(name="Mean Saturation",  value=_saturation_level(stats["mean_saturation_pct"]), inline=True)
+    embed.add_field(name="Dominant Hue",     value=_hue_range_label(stats["dominant_hue_range"]), inline=True)
+    embed.add_field(name="Palette Type",     value=classify_palette_type(colors, counts),        inline=True)
 
     top_colors_text = "\n".join(
         _color_line(rgb, cnt, total, show_rgb, show_cmyk)
@@ -130,67 +167,79 @@ def _build_stats_embed(
             value="Mean saturation is below 15% — this image is mostly grayscale.",
             inline=False,
         )
-
     embed.set_image(url="attachment://palette.png")
     return embed
 
 
-@bot.slash_command(
-    name="analyze",
-    description="Full analysis: dominant colors, stats, and charts",
-    guild_ids=guild_ids,
-)
+def _build_gradient_embed(filename, gradient_label, img, gradient_stops) -> discord.Embed:
+    _, r0, g0, b0 = gradient_stops[0]
+    _, r1, g1, b1 = gradient_stops[-1]
+    mid_r, mid_g, mid_b = (r0 + r1) // 2, (g0 + g1) // 2, (b0 + b1) // 2
+    embed = discord.Embed(
+        title=f"Gradient Map — {filename}",
+        color=discord.Color.from_rgb(mid_r, mid_g, mid_b),
+    )
+    embed.add_field(name="Gradient",   value=gradient_label,                      inline=True)
+    embed.add_field(name="Dimensions", value=f"{img.width} × {img.height} px",    inline=True)
+    embed.set_image(url="attachment://gradient_map.png")
+    embed.set_thumbnail(url="attachment://gradient_swatch.png")
+    return embed
+
+
+# ---------------------------------------------------------------------------
+# /analyze
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(name="analyze", description="Full analysis: dominant colors, stats, and charts", guild_ids=guild_ids)
 async def analyze(
     ctx: discord.ApplicationContext,
     image: discord.Option(discord.Attachment, description="Upload a painting image"),
-    num_colors: discord.Option(
-        int,
-        description="Number of dominant colors to extract (default 10)",
-        default=10,
-        min_value=3,
-        max_value=16,
-    ),
-    show_rgb: discord.Option(
-        bool,
-        description="Show RGB values for each color",
-        default=False,
-        required=False,
-    ),
-    show_cmyk: discord.Option(
-        bool,
-        description="Show CMYK values for each color",
-        default=False,
-        required=False,
-    ),
+    num_colors: discord.Option(int, description="Number of dominant colors to extract (default 10)",
+                               default=10, min_value=3, max_value=16),
+    show_rgb: discord.Option(bool, description="Show RGB values for each color", default=False, required=False),
+    show_cmyk: discord.Option(bool, description="Show CMYK values for each color", default=False, required=False),
+    saturation_boost: discord.Option(float, description="Adjust saturation: -1.0 (grayscale) to +1.0 (vivid). Default 0.",
+                                     default=0.0, min_value=-1.0, max_value=1.0, required=False),
+    brightness_boost: discord.Option(float, description="Adjust brightness: -1.0 (dark) to +1.0 (bright). Default 0.",
+                                     default=0.0, min_value=-1.0, max_value=1.0, required=False),
 ):
     await ctx.defer()
-
-    if not image.content_type or not image.content_type.startswith("image/"):
-        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+    if not await _validate_image(ctx, image):
         return
-
-    if image.size > MAX_FILE_BYTES:
-        await ctx.followup.send(f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB.")
-        return
-
     try:
         data = await image.read()
-        img = load_image_from_bytes(data)
-        colors, counts = extract_dominant_colors(img, n=num_colors)
-        stats = compute_stats(img)
+        cached = _cache_get(data, num_colors, saturation_boost, brightness_boost)
+        if cached:
+            colors, counts, stats = cached
+            img = load_image_from_bytes(data)
+            if saturation_boost != 0.0 or brightness_boost != 0.0:
+                img = adjust_image(img, saturation_boost, brightness_boost)
+        else:
+            img = load_image_from_bytes(data)
+            if saturation_boost != 0.0 or brightness_boost != 0.0:
+                img = adjust_image(img, saturation_boost, brightness_boost)
+            colors, counts = extract_dominant_colors(img, n=num_colors)
+            stats = compute_stats(img)
+            _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
 
         grayscale_warning = stats["mean_saturation_pct"] < 15
-
-        palette_buf = render_chart_to_bytesio(render_palette_chart(colors, counts))
-        hue_sat_buf = render_chart_to_bytesio(render_hue_saturation_chart(img))
-
+        palette_buf  = render_chart_to_bytesio(render_palette_chart(colors, counts))
+        hue_sat_buf  = render_chart_to_bytesio(render_hue_saturation_chart(img))
         embed = _build_stats_embed(stats, colors, counts, image.filename, grayscale_warning, show_rgb, show_cmyk)
+
+        if saturation_boost != 0.0 or brightness_boost != 0.0:
+            adj_note = []
+            if saturation_boost != 0.0:
+                adj_note.append(f"saturation {saturation_boost:+.1f}")
+            if brightness_boost != 0.0:
+                adj_note.append(f"brightness {brightness_boost:+.1f}")
+            embed.set_footer(text=f"Adjusted: {', '.join(adj_note)}")
 
         await ctx.followup.send(
             embed=embed,
             files=[
-                discord.File(palette_buf, filename="palette.png"),
-                discord.File(hue_sat_buf, filename="hue_sat.png"),
+                discord.File(palette_buf,  filename="palette.png"),
+                discord.File(hue_sat_buf,  filename="hue_sat.png"),
             ],
         )
     except Exception:
@@ -198,61 +247,46 @@ async def analyze(
         await ctx.followup.send("Something went wrong analyzing that image. Make sure it's a valid image file.")
 
 
-@bot.slash_command(
-    name="palette",
-    description="Quick color palette swatch only",
-    guild_ids=guild_ids,
-)
+# ---------------------------------------------------------------------------
+# /palette
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(name="palette", description="Quick color palette swatch only", guild_ids=guild_ids)
 async def palette(
     ctx: discord.ApplicationContext,
     image: discord.Option(discord.Attachment, description="Upload a painting image"),
-    num_colors: discord.Option(
-        int,
-        description="Number of dominant colors to extract (default 10)",
-        default=10,
-        min_value=3,
-        max_value=16,
-    ),
-    show_rgb: discord.Option(
-        bool,
-        description="Show RGB values for each color",
-        default=False,
-        required=False,
-    ),
-    show_cmyk: discord.Option(
-        bool,
-        description="Show CMYK values for each color",
-        default=False,
-        required=False,
-    ),
+    num_colors: discord.Option(int, description="Number of dominant colors to extract (default 10)",
+                               default=10, min_value=3, max_value=16),
+    show_rgb: discord.Option(bool, description="Show RGB values for each color", default=False, required=False),
+    show_cmyk: discord.Option(bool, description="Show CMYK values for each color", default=False, required=False),
+    saturation_boost: discord.Option(float, description="Adjust saturation before extracting (-1 to +1). Default 0.",
+                                     default=0.0, min_value=-1.0, max_value=1.0, required=False),
+    brightness_boost: discord.Option(float, description="Adjust brightness before extracting (-1 to +1). Default 0.",
+                                     default=0.0, min_value=-1.0, max_value=1.0, required=False),
 ):
     await ctx.defer()
-
-    if not image.content_type or not image.content_type.startswith("image/"):
-        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+    if not await _validate_image(ctx, image):
         return
-
-    if image.size > MAX_FILE_BYTES:
-        await ctx.followup.send(f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB.")
-        return
-
     try:
         data = await image.read()
-        img = load_image_from_bytes(data)
-        colors, counts = extract_dominant_colors(img, n=num_colors)
-        palette_buf = render_chart_to_bytesio(render_palette_chart(colors, counts))
+        cached = _cache_get(data, num_colors, saturation_boost, brightness_boost)
+        if cached:
+            colors, counts, _ = cached
+        else:
+            img = load_image_from_bytes(data)
+            if saturation_boost != 0.0 or brightness_boost != 0.0:
+                img = adjust_image(img, saturation_boost, brightness_boost)
+            colors, counts = extract_dominant_colors(img, n=num_colors)
+            stats = compute_stats(img)
+            _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
 
+        palette_buf = render_chart_to_bytesio(render_palette_chart(colors, counts))
         total = counts.sum()
-        lines = [
-            _color_line(rgb, cnt, total, show_rgb, show_cmyk)
-            for rgb, cnt in zip(colors, counts)
-        ]
+        lines = [_color_line(rgb, cnt, total, show_rgb, show_cmyk) for rgb, cnt in zip(colors, counts)]
         embed = discord.Embed(
             title=f"Color Palette — {image.filename}",
             description="\n".join(lines),
-            color=discord.Color.from_rgb(
-                int(colors[0][0]), int(colors[0][1]), int(colors[0][2])
-            ),
+            color=discord.Color.from_rgb(int(colors[0][0]), int(colors[0][1]), int(colors[0][2])),
         )
         embed.set_image(url="attachment://palette.png")
 
@@ -265,72 +299,46 @@ async def palette(
         await ctx.followup.send("Something went wrong. Make sure it's a valid image file.")
 
 
-def _build_gradient_embed(
-    filename: str,
-    gradient_label: str,
-    img,
-    gradient_stops: list,
-) -> discord.Embed:
-    _, r0, g0, b0 = gradient_stops[0]
-    _, r1, g1, b1 = gradient_stops[-1]
-    mid_r, mid_g, mid_b = (r0 + r1) // 2, (g0 + g1) // 2, (b0 + b1) // 2
-    embed = discord.Embed(
-        title=f"Gradient Map — {filename}",
-        color=discord.Color.from_rgb(mid_r, mid_g, mid_b),
-    )
-    embed.add_field(name="Gradient", value=gradient_label, inline=True)
-    embed.add_field(name="Dimensions", value=f"{img.width} × {img.height} px", inline=True)
-    embed.set_image(url="attachment://gradient_map.png")
-    embed.set_thumbnail(url="attachment://gradient_swatch.png")
-    return embed
+# ---------------------------------------------------------------------------
+# /gradient_map
+# ---------------------------------------------------------------------------
 
-
-@bot.slash_command(
-    name="gradient_map",
-    description="Remap image tones through a color gradient",
-    guild_ids=guild_ids,
-)
+@bot.slash_command(name="gradient_map", description="Remap image tones through a color gradient", guild_ids=guild_ids)
 async def gradient_map_cmd(
     ctx: discord.ApplicationContext,
     image: discord.Option(discord.Attachment, description="Image to process", required=True),
-    preset: discord.Option(
-        str,
-        description="Predefined gradient (default: fire)",
-        choices=["fire", "ocean", "forest", "amethyst", "grayscale", "sunset", "ice"],
-        required=False,
-        default="fire",
-    ),
-    start_color: discord.Option(
-        str,
-        description="Custom shadow color as hex (e.g. #1a0030) — overrides preset if both given",
-        required=False,
-        default=None,
-    ),
-    end_color: discord.Option(
-        str,
-        description="Custom highlight color as hex (e.g. #ffe080) — overrides preset if both given",
-        required=False,
-        default=None,
-    ),
+    preset: discord.Option(str, description="Predefined gradient (default: fire)",
+                           choices=["fire", "ocean", "forest", "amethyst", "grayscale", "sunset", "ice"],
+                           required=False, default="fire"),
+    start_color: discord.Option(str, description="Custom 2-stop: shadow hex (e.g. #1a0030) — pair with end_color",
+                                required=False, default=None),
+    end_color: discord.Option(str, description="Custom 2-stop: highlight hex (e.g. #ffe080) — pair with start_color",
+                              required=False, default=None),
+    custom_colors: discord.Option(str,
+                                  description="Multi-stop gradient: comma-separated hex list (e.g. #1a0030,#7b2d8b,#ffe080)",
+                                  required=False, default=None),
+    reverse: discord.Option(bool, description="Flip the gradient direction", default=False, required=False),
 ):
     await ctx.defer()
-
-    if not image.content_type or not image.content_type.startswith("image/"):
-        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+    if not await _validate_image(ctx, image):
         return
 
-    if image.size > MAX_FILE_BYTES:
-        await ctx.followup.send(f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB.")
-        return
-
-    if (start_color is None) != (end_color is None):
-        await ctx.followup.send("Provide both `start_color` and `end_color`, or neither.")
-        return
-
+    # Resolve gradient stops
     gradient_stops = None
     gradient_label = preset
 
-    if start_color is not None:
+    if custom_colors is not None:
+        try:
+            gradient_stops = parse_multi_hex_gradient(custom_colors)
+            hex_labels = " → ".join(p.strip().upper() for p in custom_colors.split(",") if p.strip())
+            gradient_label = f"custom ({hex_labels})"
+        except ValueError as e:
+            await ctx.followup.send(str(e))
+            return
+    elif start_color is not None or end_color is not None:
+        if (start_color is None) != (end_color is None):
+            await ctx.followup.send("Provide both `start_color` and `end_color`, or neither.")
+            return
         try:
             r0, g0, b0 = parse_hex_color(start_color)
             r1, g1, b1 = parse_hex_color(end_color)
@@ -341,6 +349,10 @@ async def gradient_map_cmd(
         gradient_label = f"custom ({start_color.upper()} → {end_color.upper()})"
     else:
         gradient_stops = GRADIENT_PRESETS[preset]
+
+    if reverse:
+        gradient_stops = reverse_gradient(gradient_stops)
+        gradient_label += " (reversed)"
 
     try:
         data = await image.read()
@@ -357,7 +369,7 @@ async def gradient_map_cmd(
         await ctx.followup.send(
             embed=embed,
             files=[
-                discord.File(out_buf, filename="gradient_map.png"),
+                discord.File(out_buf,    filename="gradient_map.png"),
                 discord.File(swatch_buf, filename="gradient_swatch.png"),
             ],
         )
@@ -366,43 +378,33 @@ async def gradient_map_cmd(
         await ctx.followup.send("Something went wrong processing the image.")
 
 
-@bot.slash_command(
-    name="palette_gradient",
-    description="Generate a gradient from the image's own colors and apply it as a tone map",
-    guild_ids=guild_ids,
-)
+# ---------------------------------------------------------------------------
+# /palette_gradient
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(name="palette_gradient",
+                   description="Generate a gradient from the image's own colors and apply it as a tone map",
+                   guild_ids=guild_ids)
 async def palette_gradient_cmd(
     ctx: discord.ApplicationContext,
     image: discord.Option(discord.Attachment, description="Image to process", required=True),
-    num_colors: discord.Option(
-        int,
-        description="Number of colors to extract for the gradient (default 5)",
-        default=5,
-        min_value=3,
-        max_value=100,
-    ),
-    sort_by: discord.Option(
-        str,
-        description="How to order colors in the gradient (default: value)",
-        choices=["value", "luminance", "hue", "saturation"],
-        default="value",
-    ),
+    num_colors: discord.Option(int, description="Number of colors to extract for the gradient (default 5)",
+                               default=5, min_value=3, max_value=100),
+    sort_by: discord.Option(str, description="How to order colors in the gradient (default: value)",
+                            choices=["value", "luminance", "hue", "saturation"], default="value"),
+    reverse: discord.Option(bool, description="Flip the gradient direction", default=False, required=False),
 ):
     await ctx.defer()
-
-    if not image.content_type or not image.content_type.startswith("image/"):
-        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+    if not await _validate_image(ctx, image):
         return
-
-    if image.size > MAX_FILE_BYTES:
-        await ctx.followup.send(f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB.")
-        return
-
     try:
         data = await image.read()
         img = load_image_from_bytes(data)
         colors, counts = extract_dominant_colors(img, n=num_colors)
         gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
+
+        if reverse:
+            gradient_stops = reverse_gradient(gradient_stops)
 
         result = apply_gradient_map(img, gradient_stops)
         out_buf = io.BytesIO()
@@ -410,24 +412,22 @@ async def palette_gradient_cmd(
         out_buf.seek(0)
 
         swatch_buf = render_gradient_preview(gradient_stops)
-
-        stop_colors = " → ".join(
-            f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in gradient_stops
-        )
+        stop_colors = " → ".join(f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in sorted(gradient_stops))
         embed = discord.Embed(
             title=f"Palette Gradient — {image.filename}",
             color=discord.Color.from_rgb(*[int(v) for v in colors[0]]),
         )
-        embed.add_field(name="Gradient", value=stop_colors, inline=False)
-        embed.add_field(name="Sorted by", value=sort_by.capitalize(), inline=True)
-        embed.add_field(name="Dimensions", value=f"{img.width} × {img.height} px", inline=True)
+        embed.add_field(name="Gradient",    value=stop_colors,                       inline=False)
+        embed.add_field(name="Sorted by",   value=sort_by.capitalize(),              inline=True)
+        embed.add_field(name="Reversed",    value="Yes" if reverse else "No",        inline=True)
+        embed.add_field(name="Dimensions",  value=f"{img.width} × {img.height} px", inline=True)
         embed.set_image(url="attachment://gradient_map.png")
         embed.set_thumbnail(url="attachment://gradient_swatch.png")
 
         await ctx.followup.send(
             embed=embed,
             files=[
-                discord.File(out_buf, filename="gradient_map.png"),
+                discord.File(out_buf,    filename="gradient_map.png"),
                 discord.File(swatch_buf, filename="gradient_swatch.png"),
             ],
         )
@@ -436,61 +436,46 @@ async def palette_gradient_cmd(
         await ctx.followup.send("Something went wrong processing the image.")
 
 
-@bot.slash_command(
-    name="export_palette",
-    description="Export dominant colors as an .ase (Photoshop) or .swatches (Procreate) file",
-    guild_ids=guild_ids,
-)
+# ---------------------------------------------------------------------------
+# /export_palette
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(name="export_palette",
+                   description="Export dominant colors as a palette file for design software",
+                   guild_ids=guild_ids)
 async def export_palette_cmd(
     ctx: discord.ApplicationContext,
     image: discord.Option(discord.Attachment, description="Image to extract colors from", required=True),
-    format: discord.Option(
-        str,
-        description="Export format",
-        choices=["ase", "swatches"],
-        default="ase",
-    ),
-    num_colors: discord.Option(
-        int,
-        description="Number of colors to extract (default 10)",
-        default=10,
-        min_value=3,
-        max_value=16,
-    ),
-    palette_name: discord.Option(
-        str,
-        description="Name for the palette (default: Palette)",
-        default="Palette",
-        required=False,
-    ),
+    format: discord.Option(str, description="Export format",
+                           choices=["ase", "swatches", "gpl", "aco", "css", "tailwind"], default="ase"),
+    num_colors: discord.Option(int, description="Number of colors to extract (default 10)",
+                               default=10, min_value=3, max_value=16),
+    palette_name: discord.Option(str, description="Name for the palette (default: Palette)",
+                                 default="Palette", required=False),
 ):
     await ctx.defer()
-
-    if not image.content_type or not image.content_type.startswith("image/"):
-        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+    if not await _validate_image(ctx, image):
         return
-
-    if image.size > MAX_FILE_BYTES:
-        await ctx.followup.send(f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB.")
-        return
-
     try:
         data = await image.read()
         img = load_image_from_bytes(data)
         colors, counts = extract_dominant_colors(img, n=num_colors)
-
         color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
 
-        if format == "ase":
-            file_bytes = export_ase(color_list, palette_name)
-            filename = "palette.ase"
-        else:
-            file_bytes = export_swatches(color_list, palette_name)
-            filename = "palette.swatches"
+        format_map = {
+            "ase":      (export_ase,      "palette.ase"),
+            "swatches": (export_swatches, "palette.swatches"),
+            "gpl":      (export_gpl,      f"{palette_name}.gpl"),
+            "aco":      (export_aco,      "palette.aco"),
+            "css":      (export_css,      "palette.css"),
+            "tailwind": (export_tailwind, "palette.json"),
+        }
+        fn, filename = format_map[format]
+        file_bytes = fn(color_list, palette_name)
 
         total = counts.sum()
         lines = [
-            f"`#{r:02X}{g:02X}{b:02X}` **{nearest_color_name((r, g, b))}** — {cnt / total * 100:.1f}%"
+            f"`#{r:02X}{g:02X}{b:02X}` {_pct_bar(cnt/total*100)} **{nearest_color_name((r,g,b))}** {cnt/total*100:.1f}%"
             for (r, g, b), cnt in zip(color_list, counts)
         ]
         embed = discord.Embed(
@@ -510,55 +495,36 @@ async def export_palette_cmd(
         await ctx.followup.send("Something went wrong exporting the palette.")
 
 
-@bot.slash_command(
-    name="export_gradient",
-    description="Export a palette-derived gradient as a .ggr (GIMP/Krita) or .json file",
-    guild_ids=guild_ids,
-)
+# ---------------------------------------------------------------------------
+# /export_gradient
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(name="export_gradient",
+                   description="Export a palette-derived gradient as a .ggr (GIMP/Krita) or .json file",
+                   guild_ids=guild_ids)
 async def export_gradient_cmd(
     ctx: discord.ApplicationContext,
     image: discord.Option(discord.Attachment, description="Image to extract colors from", required=True),
-    format: discord.Option(
-        str,
-        description="Export format (default: ggr)",
-        choices=["ggr", "json"],
-        default="ggr",
-    ),
-    num_colors: discord.Option(
-        int,
-        description="Number of colors to extract (default 5)",
-        default=5,
-        min_value=3,
-        max_value=100,
-    ),
-    sort_by: discord.Option(
-        str,
-        description="How to order colors in the gradient (default: value)",
-        choices=["value", "luminance", "hue", "saturation"],
-        default="value",
-    ),
-    gradient_name: discord.Option(
-        str,
-        description="Name embedded in the gradient file (default: palette_gradient)",
-        default="palette_gradient",
-        required=False,
-    ),
+    format: discord.Option(str, description="Export format (default: ggr)",
+                           choices=["ggr", "json"], default="ggr"),
+    num_colors: discord.Option(int, description="Number of colors to extract (default 5)",
+                               default=5, min_value=3, max_value=100),
+    sort_by: discord.Option(str, description="How to order colors in the gradient (default: value)",
+                            choices=["value", "luminance", "hue", "saturation"], default="value"),
+    gradient_name: discord.Option(str, description="Name embedded in the gradient file",
+                                  default="palette_gradient", required=False),
+    reverse: discord.Option(bool, description="Flip the gradient direction", default=False, required=False),
 ):
     await ctx.defer()
-
-    if not image.content_type or not image.content_type.startswith("image/"):
-        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
+    if not await _validate_image(ctx, image):
         return
-
-    if image.size > MAX_FILE_BYTES:
-        await ctx.followup.send(f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB.")
-        return
-
     try:
         data = await image.read()
         img = load_image_from_bytes(data)
         colors, counts = extract_dominant_colors(img, n=num_colors)
         gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
+        if reverse:
+            gradient_stops = reverse_gradient(gradient_stops)
 
         if format == "ggr":
             file_bytes = export_gradient_ggr(gradient_stops, name=gradient_name)
@@ -568,18 +534,15 @@ async def export_gradient_cmd(
             filename = f"{gradient_name}.json"
 
         swatch_buf = render_gradient_preview(gradient_stops)
-
-        stop_colors = " → ".join(
-            f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in gradient_stops
-        )
+        stop_colors = " → ".join(f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in sorted(gradient_stops))
         embed = discord.Embed(
             title=f"Gradient Export — {image.filename}",
             color=discord.Color.from_rgb(*[int(v) for v in colors[0]]),
         )
-        embed.add_field(name="Gradient", value=stop_colors, inline=False)
-        embed.add_field(name="Format", value=f".{format}", inline=True)
-        embed.add_field(name="Sorted by", value=sort_by.capitalize(), inline=True)
-        embed.add_field(name="Colors", value=str(num_colors), inline=True)
+        embed.add_field(name="Gradient",   value=stop_colors,              inline=False)
+        embed.add_field(name="Format",     value=f".{format}",             inline=True)
+        embed.add_field(name="Sorted by",  value=sort_by.capitalize(),     inline=True)
+        embed.add_field(name="Colors",     value=str(num_colors),          inline=True)
         embed.set_image(url="attachment://gradient_swatch.png")
 
         await ctx.followup.send(
@@ -594,120 +557,498 @@ async def export_gradient_cmd(
         await ctx.followup.send("Something went wrong exporting the gradient.")
 
 
+# ---------------------------------------------------------------------------
+# /color_info  — NEW
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(name="color_info",
+                   description="Look up a hex color: RGB, CMYK, HSV, name, and harmony suggestions",
+                   guild_ids=guild_ids)
+async def color_info_cmd(
+    ctx: discord.ApplicationContext,
+    hex_color: discord.Option(str, description="Hex color code, e.g. #3a7bd5 or 3a7bd5"),
+):
+    await ctx.defer()
+    try:
+        r, g, b = parse_hex_color(hex_color)
+    except ValueError as e:
+        await ctx.followup.send(str(e))
+        return
+
+    try:
+        hex_str = f"#{r:02X}{g:02X}{b:02X}"
+        name = nearest_color_name((r, g, b))
+        c, m, y, k = rgb_to_cmyk(r, g, b)
+        h_f, s_f, v_f = __import__("colorsys").rgb_to_hsv(r / 255, g / 255, b / 255)
+        h_deg = round(h_f * 360)
+        s_pct = round(s_f * 100)
+        v_pct = round(v_f * 100)
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+
+        brightness_label = "Dark" if lum < 64 else "Medium-Dark" if lum < 128 else "Medium-Light" if lum < 192 else "Light"
+        # Temperature: warm = reds/oranges/yellows (h < 60° or h > 300°), cool = blues/greens
+        warm = h_deg < 60 or h_deg > 300
+        temp_label = "Warm" if warm else ("Neutral" if 60 <= h_deg <= 80 or 160 <= h_deg <= 200 else "Cool")
+
+        # Harmony suggestions
+        import colorsys as _cs
+
+        def _hue_rgb(target_h):
+            rr, gg, bb = _cs.hsv_to_rgb(target_h % 1.0, max(s_f, 0.65), max(v_f, 0.6))
+            return (int(rr * 255), int(gg * 255), int(bb * 255))
+
+        harmonies = [
+            (_hue_rgb(h_f + 0.5),    "Complement"),
+            (_hue_rgb(h_f + 1 / 3),  "Triadic A"),
+            (_hue_rgb(h_f + 2 / 3),  "Triadic B"),
+            (_hue_rgb(h_f + 1 / 12), "Analogous +30°"),
+            (_hue_rgb(h_f - 1 / 12), "Analogous -30°"),
+        ]
+
+        swatch_buf = render_color_info_swatch((r, g, b), harmonies)
+
+        embed = discord.Embed(
+            title=f"Color Info — {hex_str}",
+            color=discord.Color.from_rgb(r, g, b),
+        )
+        embed.add_field(name="Name",        value=name,                                    inline=True)
+        embed.add_field(name="Brightness",  value=brightness_label,                        inline=True)
+        embed.add_field(name="Temperature", value=temp_label,                              inline=True)
+        embed.add_field(name="RGB",         value=f"R {r}, G {g}, B {b}",                 inline=True)
+        embed.add_field(name="HSV",         value=f"H {h_deg}°, S {s_pct}%, V {v_pct}%", inline=True)
+        embed.add_field(name="CMYK",        value=f"C {c}%, M {m}%, Y {y}%, K {k}%",     inline=True)
+        harmony_text = "\n".join(
+            f"`#{rh:02X}{gh:02X}{bh:02X}` {lbl}" for (rh, gh, bh), lbl in harmonies
+        )
+        embed.add_field(name="Harmony Suggestions", value=harmony_text, inline=False)
+        embed.set_image(url="attachment://color_info.png")
+
+        await ctx.followup.send(
+            embed=embed,
+            files=[discord.File(swatch_buf, filename="color_info.png")],
+        )
+    except Exception:
+        traceback.print_exc()
+        await ctx.followup.send("Something went wrong processing that color.")
+
+
+# ---------------------------------------------------------------------------
+# /compare  — NEW
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(name="compare",
+                   description="Compare the dominant palettes of two images side by side",
+                   guild_ids=guild_ids)
+async def compare_cmd(
+    ctx: discord.ApplicationContext,
+    image_a: discord.Option(discord.Attachment, description="First image",  required=True),
+    image_b: discord.Option(discord.Attachment, description="Second image", required=True),
+    num_colors: discord.Option(int, description="Colors to extract per image (default 8)",
+                               default=8, min_value=3, max_value=16),
+):
+    await ctx.defer()
+    for att in (image_a, image_b):
+        if not att.content_type or not att.content_type.startswith("image/"):
+            await ctx.followup.send(f"`{att.filename}` is not a valid image file.")
+            return
+        if att.size > MAX_FILE_BYTES:
+            await ctx.followup.send(f"`{att.filename}` exceeds the 15 MB limit.")
+            return
+
+    try:
+        data_a = await image_a.read()
+        data_b = await image_b.read()
+
+        img_a = load_image_from_bytes(data_a)
+        img_b = load_image_from_bytes(data_b)
+
+        colors_a, counts_a = extract_dominant_colors(img_a, n=num_colors)
+        colors_b, counts_b = extract_dominant_colors(img_b, n=num_colors)
+
+        compare_buf = render_compare_chart(
+            colors_a, counts_a, image_a.filename,
+            colors_b, counts_b, image_b.filename,
+        )
+
+        total_a, total_b = counts_a.sum(), counts_b.sum()
+
+        def _top_hex(colors, counts, total):
+            return "  ".join(
+                f"`#{int(c[0]):02X}{int(c[1]):02X}{int(c[2]):02X}` {cnt/total*100:.0f}%"
+                for c, cnt in zip(colors[:4], counts[:4])
+            )
+
+        embed = discord.Embed(
+            title="Palette Comparison",
+            color=discord.Color.from_rgb(int(colors_a[0][0]), int(colors_a[0][1]), int(colors_a[0][2])),
+        )
+        embed.add_field(name=f"🖼 {image_a.filename}", value=_top_hex(colors_a, counts_a, total_a), inline=False)
+        embed.add_field(name=f"🖼 {image_b.filename}", value=_top_hex(colors_b, counts_b, total_b), inline=False)
+        embed.add_field(name="Palette Type A", value=classify_palette_type(colors_a, counts_a), inline=True)
+        embed.add_field(name="Palette Type B", value=classify_palette_type(colors_b, counts_b), inline=True)
+        embed.set_image(url="attachment://compare.png")
+
+        await ctx.followup.send(
+            embed=embed,
+            files=[discord.File(compare_buf, filename="compare.png")],
+        )
+    except Exception:
+        traceback.print_exc()
+        await ctx.followup.send("Something went wrong comparing the images.")
+
+
+# ---------------------------------------------------------------------------
+# /colorblind  — NEW
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(name="colorblind",
+                   description="Simulate how your image looks to people with color blindness",
+                   guild_ids=guild_ids)
+async def colorblind_cmd(
+    ctx: discord.ApplicationContext,
+    image: discord.Option(discord.Attachment, description="Image to simulate", required=True),
+    type: discord.Option(str, description="Type of color blindness to simulate (default: all)",
+                         choices=["all", "deuteranopia", "protanopia", "tritanopia"],
+                         default="all", required=False),
+):
+    await ctx.defer()
+    if not await _validate_image(ctx, image):
+        return
+    try:
+        data = await image.read()
+        img = load_image_from_bytes(data)
+
+        type_labels = {
+            "deuteranopia": "Deuteranopia (red-green, missing green)",
+            "protanopia":   "Protanopia (red-green, missing red)",
+            "tritanopia":   "Tritanopia (blue-yellow, missing blue)",
+        }
+
+        if type == "all":
+            result_buf = render_colorblind_comparison(img)
+            filename = "colorblind_all.png"
+            type_label = "All types (4-panel comparison)"
+        else:
+            sim = simulate_colorblindness(img, type)
+            result_buf = io.BytesIO()
+            sim.save(result_buf, format="PNG")
+            result_buf.seek(0)
+            filename = f"colorblind_{type}.png"
+            type_label = type_labels[type]
+
+        embed = discord.Embed(
+            title=f"Color Blindness Simulation — {image.filename}",
+            color=discord.Color.from_rgb(100, 149, 237),  # cornflower blue — neutral
+        )
+        embed.add_field(name="Type",       value=type_label,                          inline=False)
+        embed.add_field(name="Dimensions", value=f"{img.width} × {img.height} px",   inline=True)
+        embed.set_image(url=f"attachment://{filename}")
+
+        await ctx.followup.send(
+            embed=embed,
+            files=[discord.File(result_buf, filename=filename)],
+        )
+    except Exception:
+        traceback.print_exc()
+        await ctx.followup.send("Something went wrong simulating color blindness.")
+
+
+# ---------------------------------------------------------------------------
+# /recolor  — NEW
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(name="recolor",
+                   description="Apply the color palette from one image onto another image",
+                   guild_ids=guild_ids)
+async def recolor_cmd(
+    ctx: discord.ApplicationContext,
+    source: discord.Option(discord.Attachment, description="Source image — palette is taken from here", required=True),
+    target: discord.Option(discord.Attachment, description="Target image — this gets recolored",        required=True),
+    num_colors: discord.Option(int, description="Colors to extract from source (default 8)",
+                               default=8, min_value=3, max_value=16),
+):
+    await ctx.defer()
+    for att in (source, target):
+        if not att.content_type or not att.content_type.startswith("image/"):
+            await ctx.followup.send(f"`{att.filename}` is not a valid image file.")
+            return
+        if att.size > MAX_FILE_BYTES:
+            await ctx.followup.send(f"`{att.filename}` exceeds the 15 MB limit.")
+            return
+
+    try:
+        src_data = await source.read()
+        tgt_data = await target.read()
+
+        src_img = load_image_from_bytes(src_data)
+        tgt_img = load_image_from_bytes(tgt_data)
+
+        colors, counts = extract_dominant_colors(src_img, n=num_colors)
+        color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
+
+        result = recolor_image(tgt_img, color_list)
+        out_buf = io.BytesIO()
+        result.save(out_buf, format="PNG")
+        out_buf.seek(0)
+
+        total = counts.sum()
+        palette_lines = "  ".join(
+            f"`#{r:02X}{g:02X}{b:02X}`" for r, g, b in color_list[:8]
+        )
+
+        embed = discord.Embed(
+            title=f"Recolor — {target.filename}",
+            color=discord.Color.from_rgb(*color_list[0]),
+        )
+        embed.add_field(name="Source Palette",
+                        value=f"From **{source.filename}** ({num_colors} colors)\n{palette_lines}",
+                        inline=False)
+        embed.add_field(name="Output Size",
+                        value=f"{result.width} × {result.height} px", inline=True)
+        embed.set_image(url="attachment://recolor.png")
+
+        await ctx.followup.send(
+            embed=embed,
+            files=[discord.File(out_buf, filename="recolor.png")],
+        )
+    except Exception:
+        traceback.print_exc()
+        await ctx.followup.send("Something went wrong recoloring the image.")
+
+
+# ---------------------------------------------------------------------------
+# /suggest_harmony  — NEW
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(name="suggest_harmony",
+                   description="Suggest colors that would harmonize with your image's existing palette",
+                   guild_ids=guild_ids)
+async def suggest_harmony_cmd(
+    ctx: discord.ApplicationContext,
+    image: discord.Option(discord.Attachment, description="Upload your painting", required=True),
+    num_colors: discord.Option(int, description="Colors to extract from the image (default 8)",
+                               default=8, min_value=3, max_value=16),
+):
+    await ctx.defer()
+    if not await _validate_image(ctx, image):
+        return
+    try:
+        data = await image.read()
+        img = load_image_from_bytes(data)
+        colors, counts = extract_dominant_colors(img, n=num_colors)
+        palette_type, suggestions = suggest_harmony_colors(colors, counts)
+
+        if not suggestions:
+            await ctx.followup.send(
+                "Could not determine harmony suggestions — the palette may be mostly grayscale."
+            )
+            return
+
+        orig_list = [tuple(int(v) for v in c) for c in colors]
+        harmony_buf = render_harmony_chart(orig_list, suggestions)
+
+        sugg_text = "\n".join(
+            f"`#{r:02X}{g:02X}{b:02X}` **{nearest_color_name((r,g,b))}** — {lbl}"
+            for (r, g, b), lbl in suggestions
+        )
+
+        embed = discord.Embed(
+            title=f"Harmony Suggestions — {image.filename}",
+            color=discord.Color.from_rgb(*orig_list[0]),
+        )
+        embed.add_field(name="Detected Palette Type", value=palette_type, inline=True)
+        embed.add_field(name="Suggested Colors", value=sugg_text, inline=False)
+        embed.set_image(url="attachment://harmony.png")
+
+        await ctx.followup.send(
+            embed=embed,
+            files=[discord.File(harmony_buf, filename="harmony.png")],
+        )
+    except Exception:
+        traceback.print_exc()
+        await ctx.followup.send("Something went wrong generating harmony suggestions.")
+
+
+# ---------------------------------------------------------------------------
+# /help
+# ---------------------------------------------------------------------------
+
 COMMAND_DOCS = {
     "analyze": {
         "summary": "Full analysis: dominant colors, image stats, and two charts",
         "description": (
-            "Uploads a painting and runs a full analysis: extracts dominant colors via KMeans clustering, "
-            "computes image statistics (brightness, contrast, saturation, dominant hue range, palette type), "
-            "and generates two chart images — a color palette swatch and a hue/saturation distribution chart."
+            "Extracts dominant colors via KMeans, computes brightness/contrast/saturation/hue stats, "
+            "classifies the palette type, and generates a color swatch chart and a hue/saturation "
+            "distribution chart. Optional saturation and brightness boosts are applied before extraction."
         ),
         "params": [
-            ("`image`", "required", "The painting to analyze (PNG, JPEG, etc., max 15 MB)"),
-            ("`num_colors`", "3–16, default 10", "How many dominant colors to extract"),
-            ("`show_rgb`", "true/false, default false", "Include RGB values alongside each color"),
-            ("`show_cmyk`", "true/false, default false", "Include CMYK values alongside each color"),
+            ("`image`",             "required",              "The painting to analyze (PNG, JPEG, max 15 MB)"),
+            ("`num_colors`",        "3–16, default 10",      "How many dominant colors to extract"),
+            ("`show_rgb`",          "true/false, default false", "Include RGB values alongside each color"),
+            ("`show_cmyk`",         "true/false, default false", "Include CMYK values alongside each color"),
+            ("`saturation_boost`",  "-1.0 to +1.0, default 0", "Adjust saturation before extracting"),
+            ("`brightness_boost`",  "-1.0 to +1.0, default 0", "Adjust brightness before extracting"),
         ],
-        "output": "Embed with stats + top 5 colors, attached `palette.png` swatch chart and `hue_sat.png` distribution chart",
+        "output": "Embed with stats + top 5 colors, `palette.png` swatch chart, `hue_sat.png` distribution chart",
     },
     "palette": {
         "summary": "Quick color palette swatch — no stats, just colors",
         "description": (
-            "Extracts dominant colors from the image and lists all of them with hex codes, color names, "
-            "and percentage coverage. Faster than /analyze when you only need the palette."
+            "Extracts dominant colors and lists all of them with hex codes, color names, "
+            "a percentage bar, and optional RGB/CMYK values. Faster than /analyze."
         ),
         "params": [
-            ("`image`", "required", "The painting to analyze (PNG, JPEG, etc., max 15 MB)"),
-            ("`num_colors`", "3–16, default 10", "How many dominant colors to extract"),
-            ("`show_rgb`", "true/false, default false", "Include RGB values alongside each color"),
-            ("`show_cmyk`", "true/false, default false", "Include CMYK values alongside each color"),
+            ("`image`",            "required",                  "The painting (PNG, JPEG, max 15 MB)"),
+            ("`num_colors`",       "3–16, default 10",          "How many dominant colors to extract"),
+            ("`show_rgb`",         "true/false, default false", "Include RGB values"),
+            ("`show_cmyk`",        "true/false, default false", "Include CMYK values"),
+            ("`saturation_boost`", "-1.0 to +1.0, default 0",  "Adjust saturation before extracting"),
+            ("`brightness_boost`", "-1.0 to +1.0, default 0",  "Adjust brightness before extracting"),
         ],
-        "output": "Embed listing all colors with hex/name/%, attached `palette.png` swatch chart",
+        "output": "Embed listing all colors with hex/name/bar/%, attached `palette.png`",
     },
     "gradient_map": {
         "summary": "Remap image tones through a color gradient",
         "description": (
-            "Applies a gradient map to the image — each pixel's luminance value is remapped to a color "
-            "from the chosen gradient, replacing the original colors while preserving light/dark structure. "
-            "Choose a preset or supply custom shadow/highlight hex colors."
+            "Applies a gradient map — each pixel's luminance is remapped to a color from the chosen "
+            "gradient, preserving light/dark structure. Use a preset, a 2-stop custom pair, "
+            "or a comma-separated multi-stop hex list. Add `reverse:True` to flip the gradient."
         ),
         "params": [
-            ("`image`", "required", "Image to process (PNG, JPEG, etc., max 15 MB)"),
-            ("`preset`", "fire/ocean/forest/amethyst/grayscale/sunset/ice, default fire", "Built-in gradient preset"),
-            ("`start_color`", "hex, e.g. `#1a0030`, optional", "Custom shadow (darkest) color — must be paired with `end_color`"),
-            ("`end_color`", "hex, e.g. `#ffe080`, optional", "Custom highlight (lightest) color — must be paired with `start_color`"),
+            ("`image`",         "required",          "Image to process (max 15 MB)"),
+            ("`preset`",        "fire/ocean/forest/amethyst/grayscale/sunset/ice, default fire", "Built-in gradient"),
+            ("`start_color`",   "hex, optional",     "Custom 2-stop shadow color — pair with end_color"),
+            ("`end_color`",     "hex, optional",     "Custom 2-stop highlight color — pair with start_color"),
+            ("`custom_colors`", "hex list, optional","Multi-stop: `#1a0030,#7b2d8b,#ffe080` overrides preset"),
+            ("`reverse`",       "true/false",        "Flip the gradient direction"),
         ],
-        "output": "Embed with gradient label and dimensions, attached `gradient_map.png` result and `gradient_swatch.png` preview",
+        "output": "Embed with label and dimensions, `gradient_map.png` result, `gradient_swatch.png` preview",
     },
     "palette_gradient": {
         "summary": "Auto-generate a gradient from the image's own colors and apply it",
         "description": (
-            "Extracts the dominant colors from the image, orders them by the chosen sorting dimension "
-            "(HSV value, luminance, hue, or saturation) to form gradient stops, then applies that gradient "
-            "as a tone map back onto the image. No preset needed — the gradient is derived from the image itself. "
-            "To download the gradient as a file, use /export_gradient."
+            "Extracts dominant colors, sorts them by the chosen dimension, applies as a tone map. "
+            "Use `reverse:True` to flip. Export the resulting gradient with /export_gradient."
         ),
         "params": [
-            ("`image`", "required", "Image to process (PNG, JPEG, etc., max 15 MB)"),
-            ("`num_colors`", "3–10, default 5", "Number of colors to extract for the gradient"),
-            ("`sort_by`", "value/luminance/hue/saturation, default value",
-             "How to order colors: `value` = HSV brightness (max R/G/B), `luminance` = weighted Rec.601, "
-             "`hue` = color wheel angle, `saturation` = HSV saturation"),
+            ("`image`",       "required",                                   "Image to process (max 15 MB)"),
+            ("`num_colors`",  "3–100, default 5",                           "Colors to extract for the gradient"),
+            ("`sort_by`",     "value/luminance/hue/saturation, default value", "How to order colors in the gradient"),
+            ("`reverse`",     "true/false",                                 "Flip the gradient direction"),
         ],
-        "output": "Embed with gradient hex stops, sort mode, and dimensions; attached `gradient_map.png` result and `gradient_swatch.png` preview",
+        "output": "Embed with gradient stops; `gradient_map.png` result, `gradient_swatch.png` preview",
     },
     "export_palette": {
-        "summary": "Export colors as an .ase (Photoshop) or .swatches (Procreate) file",
+        "summary": "Export colors as .ase, .swatches, .gpl, .aco, .css, or .json (Tailwind)",
         "description": (
-            "Extracts dominant colors and exports them as a palette file compatible with design software. "
-            "`ase` produces an Adobe Swatch Exchange file importable in Photoshop, Illustrator, and InDesign. "
-            "`swatches` produces a JSON-based file importable directly in Procreate."
+            "Extracts dominant colors and exports a palette file. "
+            "`.ase` = Adobe (Photoshop/Illustrator/InDesign). "
+            "`.swatches` = Procreate. "
+            "`.gpl` = GIMP Palette. "
+            "`.aco` = Photoshop Color Swatch. "
+            "`.css` = CSS custom properties. "
+            "`.json` = Tailwind config color extension."
         ),
         "params": [
-            ("`image`", "required", "Image to extract colors from (PNG, JPEG, etc., max 15 MB)"),
-            ("`format`", "ase/swatches, default ase", "Export format: `.ase` for Adobe apps or `.swatches` for Procreate"),
-            ("`num_colors`", "3–16, default 10", "Number of colors to extract"),
-            ("`palette_name`", "text, default `Palette`", "Name embedded in the palette file"),
+            ("`image`",        "required",                           "Image to extract colors from (max 15 MB)"),
+            ("`format`",       "ase/swatches/gpl/aco/css/tailwind",  "Export format"),
+            ("`num_colors`",   "3–16, default 10",                   "Number of colors to extract"),
+            ("`palette_name`", "text, default `Palette`",            "Name embedded in the file"),
         ],
-        "output": "Embed listing all colors, attached `palette.ase` or `palette.swatches` file for download",
+        "output": "Embed listing all colors, attached palette file for download",
     },
     "export_gradient": {
         "summary": "Export a palette-derived gradient as a .ggr (GIMP/Krita) or .json file",
         "description": (
-            "Extracts dominant colors from the image, sorts them into gradient stops by the chosen dimension, "
-            "and exports the result as a gradient file. `.ggr` is the GIMP Gradient format, importable in GIMP "
-            "and Krita. `.json` is a generic format suitable for custom tooling or web use. "
-            "No tone map is applied to the image — this command only produces the gradient definition file."
+            "Extracts dominant colors, sorts into gradient stops, and exports. "
+            "`.ggr` = GIMP/Krita. `.json` = generic. Use `reverse:True` to flip."
         ),
         "params": [
-            ("`image`", "required", "Image to extract colors from (PNG, JPEG, etc., max 15 MB)"),
-            ("`format`", "ggr/json, default ggr", "Export format: `.ggr` for GIMP/Krita, `.json` for generic use"),
-            ("`num_colors`", "3–10, default 5", "Number of colors to extract"),
-            ("`sort_by`", "value/luminance/hue/saturation, default value",
-             "Sorting dimension for the gradient stops"),
-            ("`gradient_name`", "text, default `palette_gradient`", "Name embedded in the exported file"),
+            ("`image`",         "required",                              "Image (max 15 MB)"),
+            ("`format`",        "ggr/json, default ggr",                "Export format"),
+            ("`num_colors`",    "3–100, default 5",                     "Colors to extract"),
+            ("`sort_by`",       "value/luminance/hue/saturation",        "Sorting dimension"),
+            ("`gradient_name`", "text, default `palette_gradient`",      "Name in the file"),
+            ("`reverse`",       "true/false",                            "Flip the gradient direction"),
         ],
-        "output": "Embed listing the gradient stops and settings, attached `.ggr` or `.json` file for download",
+        "output": "Embed with gradient stops, attached gradient file",
+    },
+    "color_info": {
+        "summary": "Look up any hex color: RGB, CMYK, HSV, name, and harmony suggestions",
+        "description": (
+            "No image needed. Provide any hex color and get back all color representations, "
+            "a nearest named-color match, perceived brightness, temperature (warm/cool), "
+            "and a set of harmony suggestions (complement, triadic, analogous) with a swatch chart."
+        ),
+        "params": [
+            ("`hex_color`", "required", "Hex color code, e.g. `#3a7bd5` or `3a7bd5`"),
+        ],
+        "output": "Embed with color data + harmony list, `color_info.png` swatch",
+    },
+    "compare": {
+        "summary": "Side-by-side palette comparison of two images",
+        "description": (
+            "Uploads two images and extracts a dominant palette from each. "
+            "Renders a two-row chart showing both palettes proportionally, "
+            "and reports the palette type of each."
+        ),
+        "params": [
+            ("`image_a`",    "required",         "First image (max 15 MB)"),
+            ("`image_b`",    "required",         "Second image (max 15 MB)"),
+            ("`num_colors`", "3–16, default 8",  "Colors to extract per image"),
+        ],
+        "output": "Embed with top colors from each image, `compare.png` two-row chart",
+    },
+    "colorblind": {
+        "summary": "Simulate how your image looks with color blindness",
+        "description": (
+            "Renders the image as it appears to viewers with deuteranopia (red-green, missing green), "
+            "protanopia (red-green, missing red), or tritanopia (blue-yellow). "
+            "Choose `all` (default) for a 4-panel comparison grid, or pick a specific type."
+        ),
+        "params": [
+            ("`image`", "required", "Image to simulate (max 15 MB)"),
+            ("`type`",  "all/deuteranopia/protanopia/tritanopia, default all", "Which simulation to run"),
+        ],
+        "output": "4-panel comparison image (all) or single simulation PNG",
+    },
+    "recolor": {
+        "summary": "Apply one image's color palette onto another image",
+        "description": (
+            "Extracts dominant colors from the source image, then remaps every pixel in the target "
+            "image to its nearest color in that palette. Creates a stylized 'palette transfer' effect "
+            "popular in concept art workflows."
+        ),
+        "params": [
+            ("`source`",     "required",        "Image whose palette is used (max 15 MB)"),
+            ("`target`",     "required",        "Image to recolor (max 15 MB)"),
+            ("`num_colors`", "3–16, default 8", "Colors to extract from source"),
+        ],
+        "output": "Embed showing the source palette used, `recolor.png` result",
+    },
+    "suggest_harmony": {
+        "summary": "Suggest colors that would harmonize with your image's palette",
+        "description": (
+            "Analyzes the palette type of your image and suggests 2–3 colors that would "
+            "harmonize well but are not already present. Monochromatic/Analogous palettes get "
+            "complement and split-complement suggestions; Complementary palettes get triadic additions; etc."
+        ),
+        "params": [
+            ("`image`",      "required",         "Upload your painting (max 15 MB)"),
+            ("`num_colors`", "3–16, default 8",  "Colors to extract from the image"),
+        ],
+        "output": "Embed with suggested hex colors and labels, `harmony.png` swatch chart",
     },
 }
 
 _HELP_CHOICES = list(COMMAND_DOCS.keys())
 
 
-@bot.slash_command(
-    name="help",
-    description="Show available commands and how to use them",
-    guild_ids=guild_ids,
-)
+@bot.slash_command(name="help", description="Show available commands and how to use them", guild_ids=guild_ids)
 async def help_cmd(
     ctx: discord.ApplicationContext,
-    command: discord.Option(
-        str,
-        description="Get detailed help for a specific command",
-        choices=_HELP_CHOICES,
-        required=False,
-        default=None,
-    ),
+    command: discord.Option(str, description="Get detailed help for a specific command",
+                            choices=_HELP_CHOICES, required=False, default=None),
 ):
     if command is None:
         embed = discord.Embed(
@@ -730,7 +1071,7 @@ async def help_cmd(
             f"**{p}** ({default}) — {desc}" for p, default, desc in doc["params"]
         )
         embed.add_field(name="Parameters", value=param_lines, inline=False)
-        embed.add_field(name="Output", value=doc["output"], inline=False)
+        embed.add_field(name="Output",     value=doc["output"], inline=False)
         await ctx.respond(embed=embed)
 
 
