@@ -95,8 +95,9 @@ def _hue_range_label(hue_range: tuple[int, int]) -> str:
         (270, 330): "Violet", (330, 360): "Red",
     }
     start, end = hue_range
+    hi_end = end + 360 if end < start else end
+    mid = ((start + hi_end) / 2) % 360
     for (lo, hi), name in hue_names.items():
-        mid = (start + end) / 2 % 360
         if lo <= mid < hi:
             return f"{name} ({start}–{end}°)"
     return f"{start}–{end}°"
@@ -168,6 +169,7 @@ def _build_stats_embed(
             inline=False,
         )
     embed.set_image(url="attachment://palette.png")
+    embed.set_thumbnail(url="attachment://hue_sat.png")
     return embed
 
 
