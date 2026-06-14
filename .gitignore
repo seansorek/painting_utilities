@@ -8,3 +8,6 @@ venv/
 .claude/settings.local.json
 .claude/
 .claude/*
+.coverage
+htmlcov/
+.pytest_cache/
