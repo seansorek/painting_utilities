@@ -42,7 +42,7 @@ Each server's channel configuration is stored independently in `config.json`. Da
 
 ## Access control
 
-Run `/set_required_role` in a server to restrict all bot commands to members with a specific role. This is stored per-server in `config.json`, so each server can have a different required role (or none at all). Administrators always bypass the check. Users without the required role receive an ephemeral error message.
+Run `/set_required_role` in a server to allow a role to use the bot. Until this is configured, only administrators can use any commands. Administrators always bypass the check regardless. Users without the required role receive an ephemeral error message.
 
 ---
 
@@ -269,7 +269,7 @@ Set the forum channel where daily prompts will be posted for this server. Stored
 ---
 
 ### `/set_required_role`
-Restrict all bot commands in this server to members with a specific role. Stored per-server in `config.json`. Administrators always bypass this check. Run without a role restriction configured and anyone can use the bot.
+Allow a role to use the bot in this server. Until this is run, only administrators can use any commands. Stored per-server in `config.json`. Administrators always bypass this check.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|

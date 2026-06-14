@@ -105,7 +105,7 @@ async def _require_bot_role(ctx: discord.ApplicationContext) -> bool:
         return True
     required_role_id = _get_guild_required_role(ctx.guild_id)
     if not required_role_id:
-        return True
+        return False
     return any(role.id == int(required_role_id) for role in member.roles)
 
 
