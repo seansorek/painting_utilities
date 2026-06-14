@@ -101,12 +101,18 @@ async def _require_bot_role(ctx: discord.ApplicationContext) -> bool:
     if not ctx.guild:
         return True
     member = ctx.author
-    if member.guild_permissions.administrator:
+    # Guild owner always has implicit admin — reliable from the guild object itself
+    if ctx.guild.owner_id == member.id:
+        return True
+    # Check administrator permission only when we have a proper Member object
+    if isinstance(member, discord.Member) and member.guild_permissions.administrator:
         return True
     required_role_id = _get_guild_required_role(ctx.guild_id)
     if not required_role_id:
         return False
-    return any(role.id == int(required_role_id) for role in member.roles)
+    return isinstance(member, discord.Member) and any(
+        role.id == int(required_role_id) for role in member.roles
+    )
 
 
 @bot.event
