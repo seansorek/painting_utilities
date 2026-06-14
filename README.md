@@ -1,6 +1,6 @@
 # Painting Utilities
 
-A Discord bot for analyzing painting images and extracting color palettes. Useful for digital artists, designers, and painters who want to understand the colors in their work or export palettes to professional tools.
+A Discord bot for analyzing painting images, extracting color palettes, and running daily art challenges. Useful for digital artists, designers, and painters.
 
 ## Setup
 
@@ -14,7 +14,16 @@ Create a `.env` file in the project root:
 
 ```
 DISCORD_TOKEN=your_bot_token_here
-DISCORD_GUILD_ID=your_guild_id_here   # optional; omit for global commands
+
+# Command registration scope — leave blank for global (all servers, up to 1 hour to propagate)
+# or set to one guild ID for instant registration in that server only (useful for testing)
+DISCORD_GUILD_ID=your_guild_id_here
+
+# Optional: restrict all bot commands to users who have this role (admins always bypass)
+BOT_REQUIRED_ROLE_ID=role_id_here
+
+# Optional: role to ping in daily art prompt posts
+DAILY_ROLE_ID=role_id_here
 ```
 
 Run the bot:
@@ -25,9 +34,28 @@ python bot.py
 
 ---
 
+## Multi-server usage
+
+The bot works in any number of servers without changes to `.env`. Remove or leave `DISCORD_GUILD_ID` blank so slash commands register globally. Then in each server:
+
+1. Invite the bot with the appropriate permissions (slash commands, forum post creation)
+2. Run `/set_daily_channel` to point the bot at that server's forum channel
+
+Each server's channel configuration is stored independently in `config.json`. Daily challenge schedules are also per-server — running `/daily_challenge` in one server only affects that server's queue.
+
+---
+
+## Access control
+
+Set `BOT_REQUIRED_ROLE_ID` in `.env` to restrict all commands to members with a specific role. Administrators always bypass this check regardless of role. Users without the required role receive an ephemeral error message.
+
+---
+
 ## Commands
 
 All commands are Discord slash commands. Images must be PNG or JPEG, max 15 MB.
+
+---
 
 ### `/analyze`
 Full image analysis: dominant colors, image statistics, and two chart images.
@@ -39,12 +67,12 @@ Full image analysis: dominant colors, image statistics, and two chart images.
 | `show_rgb` | false | Include RGB values for each color |
 | `show_cmyk` | false | Include CMYK values for each color |
 
-**Output:** Embed with dimensions, brightness, contrast, saturation, dominant hue range, palette type, and top 5 colors. Attachments: `palette.png` swatch chart and `hue_sat.png` hue/saturation distribution chart.
+**Output:** Embed with dimensions, brightness, contrast, saturation, dominant hue, and palette type. Attachments: `palette.png` swatch chart and `hue_sat.png` hue/saturation distribution chart.
 
 ---
 
 ### `/palette`
-Quick color palette extraction — no stats, just colors.
+Quick color palette extraction — colors only, no stats.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -53,12 +81,12 @@ Quick color palette extraction — no stats, just colors.
 | `show_rgb` | false | Include RGB values for each color |
 | `show_cmyk` | false | Include CMYK values for each color |
 
-**Output:** Embed listing all colors with hex codes, color names, and coverage percentages. Attachment: `palette.png` swatch chart.
+**Output:** Embed listing all colors with hex codes, names, and coverage percentages. Attachment: `palette.png` swatch chart.
 
 ---
 
 ### `/gradient_map`
-Remap image tones through a color gradient. Each pixel's luminance is mapped to a color from the gradient, preserving light/dark structure while replacing original colors.
+Remap image tones through a color gradient. Each pixel's luminance maps to a gradient color, preserving light/dark structure while replacing original hues.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -67,7 +95,7 @@ Remap image tones through a color gradient. Each pixel's luminance is mapped to 
 | `start_color` | — | Custom shadow color as hex (e.g. `#1a0030`) — must be paired with `end_color` |
 | `end_color` | — | Custom highlight color as hex (e.g. `#ffe080`) — must be paired with `start_color` |
 
-**Output:** Embed with gradient label and image dimensions. Attachments: `gradient_map.png` result and `gradient_swatch.png` preview strip.
+**Output:** Attachments: `gradient_map.png` result and `gradient_swatch.png` preview strip.
 
 ---
 
@@ -79,7 +107,7 @@ Extract the image's dominant colors, arrange them by luminance into gradient sto
 | `image` | required | Image to process |
 | `num_colors` | 5 (3–10) | Colors to extract for the gradient |
 
-**Output:** Embed with gradient hex stops and image dimensions. Attachments: `gradient_map.png` result and `gradient_swatch.png` preview strip.
+**Output:** Embed with hex stops. Attachments: `gradient_map.png` result and `gradient_swatch.png` preview strip.
 
 ---
 
@@ -89,11 +117,88 @@ Extract dominant colors and export them as a palette file for design software.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `image` | required | Image to extract colors from |
-| `format` | `ase` | `ase` for Adobe apps (Photoshop, Illustrator, InDesign) or `swatches` for Procreate |
+| `format` | `ase` | `ase` (Adobe), `swatches` (Procreate), `gpl` (GIMP/Inkscape), `aco` (Photoshop legacy), `css` (CSS variables), `tailwind` (Tailwind config) |
 | `num_colors` | 10 (3–16) | Number of colors to extract |
 | `palette_name` | `Palette` | Name embedded in the palette file |
 
-**Output:** Embed listing all colors with hex codes, names, and coverage. Attachment: `palette.ase` or `palette.swatches` file ready to import.
+**Output:** Embed listing colors with hex codes and coverage. Attachment: palette file ready to import.
+
+---
+
+### `/export_gradient`
+Export an image-derived gradient as a file for GIMP/Krita or JSON.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `image` | required | Image to extract colors from |
+| `format` | `ggr` | `ggr` (GIMP/Krita) or `json` |
+| `num_colors` | 5 (3–100) | Colors to extract |
+| `sort_by` | `value` | How to order colors in the gradient: `value`, `luminance`, `hue`, `saturation` |
+| `gradient_name` | `palette_gradient` | Name embedded in the file |
+| `reverse` | false | Flip the gradient direction |
+
+**Output:** Embed with gradient hex stops and preview strip. Attachment: `.ggr` or `.json` gradient file.
+
+---
+
+### `/color_info`
+Look up a hex color: name, RGB, CMYK, HSV, brightness, temperature, and harmony suggestions.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `hex_color` | required | Hex code, e.g. `#3a7bd5` or `3a7bd5` |
+
+**Output:** Embed with all color properties and a swatch image showing the color alongside complement, triadic, and analogous harmonies.
+
+---
+
+### `/compare`
+Compare the dominant palettes of two images side by side.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `image_a` | required | First image |
+| `image_b` | required | Second image |
+| `num_colors` | 8 (3–16) | Colors to extract per image |
+
+**Output:** Embed with top colors from each image and their palette types. Attachment: `compare.png` side-by-side chart.
+
+---
+
+### `/colorblind`
+Simulate how your image looks to people with color blindness.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `image` | required | Image to simulate |
+| `type` | `all` | `all` (4-panel comparison), `deuteranopia`, `protanopia`, or `tritanopia` |
+
+**Output:** Attachment: simulated image or 4-panel comparison chart.
+
+---
+
+### `/recolor`
+Apply the color palette from one image onto another.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `source` | required | Image whose palette is extracted |
+| `target` | required | Image to recolor |
+| `num_colors` | 8 (3–16) | Colors to extract from source |
+
+**Output:** Attachment: `recolor.png` — the target image recolored with the source palette.
+
+---
+
+### `/suggest_harmony`
+Suggest colors that would harmonize with the existing palette in an image.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `image` | required | Your painting |
+| `num_colors` | 8 (3–16) | Colors to extract from the image |
+
+**Output:** Embed listing suggested harmony colors (complement, triadic, analogous). Attachment: harmony chart.
 
 ---
 
@@ -104,3 +209,55 @@ Show all available commands, or get detailed parameter info for a specific comma
 /help                        — overview of all commands
 /help command:analyze        — detailed help for /analyze
 ```
+
+---
+
+## Daily art challenge (admin only)
+
+These commands require the Administrator permission.
+
+### `/daily_challenge`
+Schedule a formatted art prompt thread in the configured forum channel.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `day` | required | Label shown at the top of the post, e.g. `Day 42` or `Saturday` |
+| `description` | required | The art prompt text |
+| `release_time` | `18:00` (6 PM ET) | When to post — e.g. `18:00`, `6pm`, `6:30pm` |
+| `reference` | random from `references.json` | Discord image URL to show as a reference |
+| `minimum_time` | random 1–15 min | Suggested minimum time, e.g. `10 minutes` |
+| `extra_challenge` | — | Optional additional challenge text |
+
+The post is saved to `daily_schedule.json` and fired by a background task that checks every minute. It survives bot restarts. The resulting forum thread looks like:
+
+```
+DAILY ART PROMPT
+
+Day 42
+@dailyprompt
+Paint a stormy coastline
+
+□  □  □
+
+REFERENCE
+> https://...
+
+MINIMUM TIME
+> 7 minutes
+
+EXTRA CHALLENGE
+> Use only cool tones
+
+□  □  □
+```
+
+**Random references:** add Discord CDN image URLs (one per entry) to `references.json` and they will be picked at random when no `reference` is provided.
+
+---
+
+### `/set_daily_channel`
+Set the forum channel where daily prompts will be posted for this server. Stored in `config.json` and persists across restarts. Run this once per server after inviting the bot.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `channel` | required | The forum channel to post into |
