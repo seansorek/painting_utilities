@@ -96,16 +96,20 @@ async def on_ready():
     _post_scheduled_challenges.start()
 
 
+def _is_guild_admin(member: discord.Member) -> bool:
+    p = member.guild_permissions
+    return p.administrator or p.manage_guild
+
+
 @bot.check
 async def _require_bot_role(ctx: discord.ApplicationContext) -> bool:
     if not ctx.guild:
         return True
-    member = ctx.author
-    # Guild owner always has implicit admin — reliable from the guild object itself
+    # Prefer guild cache — has full live role data vs. interaction snapshot
+    member = ctx.guild.get_member(ctx.author.id) or ctx.author
     if ctx.guild.owner_id == member.id:
         return True
-    # Check administrator permission only when we have a proper Member object
-    if isinstance(member, discord.Member) and member.guild_permissions.administrator:
+    if isinstance(member, discord.Member) and _is_guild_admin(member):
         return True
     required_role_id = _get_guild_required_role(ctx.guild_id)
     if not required_role_id:
@@ -1324,7 +1328,7 @@ async def _post_scheduled_challenges() -> None:
     description="Schedule a daily art prompt thread in the configured forum channel",
     guild_ids=guild_ids,
 )
-@discord.default_permissions(administrator=True)
+@discord.default_permissions(manage_guild=True)
 async def daily_challenge(
     ctx: discord.ApplicationContext,
     day: discord.Option(str, description='Label shown in the post header, e.g. "Day 42" or "Saturday"'),
@@ -1416,7 +1420,7 @@ async def daily_challenge(
     description="Set the forum channel where daily art prompts will be posted (admin only)",
     guild_ids=guild_ids,
 )
-@discord.default_permissions(administrator=True)
+@discord.default_permissions(manage_guild=True)
 async def set_daily_channel(
     ctx: discord.ApplicationContext,
     channel: discord.Option(discord.ForumChannel, description="The forum channel to post daily prompts in"),
@@ -1437,7 +1441,7 @@ async def set_daily_channel(
     description="Set the role pinged in daily art prompt posts for this server (admin only)",
     guild_ids=guild_ids,
 )
-@discord.default_permissions(administrator=True)
+@discord.default_permissions(manage_guild=True)
 async def set_daily_role(
     ctx: discord.ApplicationContext,
     role: discord.Option(discord.Role, description="Role to ping when a daily prompt is posted"),
@@ -1458,7 +1462,7 @@ async def set_daily_role(
     description="Set the role required to use this bot in this server (admin only)",
     guild_ids=guild_ids,
 )
-@discord.default_permissions(administrator=True)
+@discord.default_permissions(manage_guild=True)
 async def set_required_role(
     ctx: discord.ApplicationContext,
     role: discord.Option(discord.Role, description="Role required to use the bot. Admins always bypass this."),
