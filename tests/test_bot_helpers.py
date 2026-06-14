@@ -116,3 +116,30 @@ class TestCache:
         assert len(bot._IMAGE_CACHE) == bot._CACHE_MAX
         # The first-inserted entry was evicted.
         assert bot._cache_get(b"img0", 8) is None
+
+    def test_cache_set_does_not_raise_on_concurrent_eviction(self):
+        """_cache_set must not raise if another coroutine already evicted the oldest entry."""
+        # Fill cache to max
+        for i in range(bot._CACHE_MAX):
+            bot._cache_set(f"img{i}".encode(), 8, 0.0, 0.0, i, i, i)
+
+        # Simulate the race: manually evict the first key before _cache_set runs the eviction
+        first_key = next(iter(bot._IMAGE_CACHE))
+        del bot._IMAGE_CACHE[first_key]
+
+        # _cache_set should not raise even though the oldest key is already gone
+        bot._cache_set(b"race_winner", 8, 0.0, 0.0, "x", "y", "z")
+        assert bot._cache_get(b"race_winner", 8) == ("x", "y", "z")
+
+    def test_cache_set_does_not_raise_on_empty_cache_race(self):
+        """_cache_set must not raise if another coroutine emptied the cache entirely."""
+        # Fill cache to max
+        for i in range(bot._CACHE_MAX):
+            bot._cache_set(f"img{i}".encode(), 8, 0.0, 0.0, i, i, i)
+
+        # Simulate extreme race: entire cache was cleared between len() check and pop()
+        bot._IMAGE_CACHE.clear()
+
+        # _cache_set should not raise on StopIteration from next(iter({}))
+        bot._cache_set(b"race_empty", 8, 0.0, 0.0, "a", "b", "c")
+        assert bot._cache_get(b"race_empty", 8) == ("a", "b", "c")

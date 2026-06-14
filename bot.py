@@ -82,7 +82,10 @@ def _cache_get(data: bytes, n: int, sat: float = 0.0, bri: float = 0.0):
 def _cache_set(data: bytes, n: int, sat: float, bri: float, colors, counts, stats):
     key = _cache_key(data, n, sat, bri)
     if len(_IMAGE_CACHE) >= _CACHE_MAX:
-        _IMAGE_CACHE.pop(next(iter(_IMAGE_CACHE)))
+        try:
+            _IMAGE_CACHE.pop(next(iter(_IMAGE_CACHE)))
+        except (KeyError, StopIteration):
+            pass
     _IMAGE_CACHE[key] = (colors, counts, stats)
 
 
