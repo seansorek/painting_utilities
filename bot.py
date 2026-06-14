@@ -52,7 +52,6 @@ TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 guild_ids = [int(GUILD_ID)] if GUILD_ID else None
 
-DAILY_ROLE_ID = os.getenv("DAILY_ROLE_ID")
 ET = pytz.timezone("America/New_York")
 
 _REFERENCES_FILE = os.path.join(os.path.dirname(__file__), "references.json")
@@ -1184,6 +1183,26 @@ def _set_guild_required_role(guild_id: int, role_id: str) -> None:
         json.dump(cfg, f, indent=2)
 
 
+def _get_guild_daily_role(guild_id: int) -> str | None:
+    try:
+        with open(_CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg.get("guild_daily_roles", {}).get(str(guild_id))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _set_guild_daily_role(guild_id: int, role_id: str) -> None:
+    try:
+        with open(_CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        cfg = {}
+    cfg.setdefault("guild_daily_roles", {})[str(guild_id)] = role_id
+    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
 _TIME_RE = re.compile(
     r"^(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ampm>am|pm)?$",
     re.IGNORECASE,
@@ -1220,8 +1239,10 @@ def _format_daily_post(challenge: dict) -> str:
     reference   = challenge.get("reference")
     min_time    = challenge.get("minimum_time", "")
     extra       = challenge.get("extra_challenge")
+    guild_id    = challenge.get("guild_id")
 
-    role_line = f"<@&{DAILY_ROLE_ID}>" if DAILY_ROLE_ID else ""
+    daily_role_id = _get_guild_daily_role(int(guild_id)) if guild_id else None
+    role_line = f"<@&{daily_role_id}>" if daily_role_id else ""
 
     lines = [
         "**DAILY ART PROMPT**",
@@ -1397,6 +1418,27 @@ async def set_daily_channel(
     _set_guild_channel(ctx.guild_id, str(channel.id))
     await ctx.respond(
         f"✓ Daily challenge channel set to {channel.mention}.",
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /set_daily_role
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(
+    name="set_daily_role",
+    description="Set the role pinged in daily art prompt posts for this server (admin only)",
+    guild_ids=guild_ids,
+)
+@discord.default_permissions(administrator=True)
+async def set_daily_role(
+    ctx: discord.ApplicationContext,
+    role: discord.Option(discord.Role, description="Role to ping when a daily prompt is posted"),
+):
+    _set_guild_daily_role(ctx.guild_id, str(role.id))
+    await ctx.respond(
+        f"✓ Daily prompt will now ping {role.mention}.",
         ephemeral=True,
     )
 

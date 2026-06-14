@@ -19,8 +19,6 @@ DISCORD_TOKEN=your_bot_token_here
 # or set to one guild ID for instant registration in that server only (useful for testing)
 DISCORD_GUILD_ID=your_guild_id_here
 
-# Optional: role to ping in daily art prompt posts
-DAILY_ROLE_ID=role_id_here
 ```
 
 Run the bot:
@@ -249,6 +247,15 @@ EXTRA CHALLENGE
 ```
 
 **Random references:** add Discord CDN image URLs (one per entry) to `references.json` and they will be picked at random when no `reference` is provided.
+
+---
+
+### `/set_daily_role`
+Set the role pinged in daily prompt posts for this server. Stored per-server in `config.json`. Omit to post without a ping.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `role` | required | Role to ping when a daily prompt is posted |
 
 ---
 
