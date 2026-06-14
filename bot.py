@@ -52,8 +52,7 @@ TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 guild_ids = [int(GUILD_ID)] if GUILD_ID else None
 
-DAILY_ROLE_ID       = os.getenv("DAILY_ROLE_ID")
-BOT_REQUIRED_ROLE_ID = os.getenv("BOT_REQUIRED_ROLE_ID")
+DAILY_ROLE_ID = os.getenv("DAILY_ROLE_ID")
 ET = pytz.timezone("America/New_York")
 
 _REFERENCES_FILE = os.path.join(os.path.dirname(__file__), "references.json")
@@ -100,18 +99,22 @@ async def on_ready():
 
 @bot.check
 async def _require_bot_role(ctx: discord.ApplicationContext) -> bool:
-    if not BOT_REQUIRED_ROLE_ID or not ctx.guild:
+    if not ctx.guild:
         return True
     member = ctx.author
     if member.guild_permissions.administrator:
         return True
-    return any(role.id == int(BOT_REQUIRED_ROLE_ID) for role in member.roles)
+    required_role_id = _get_guild_required_role(ctx.guild_id)
+    if not required_role_id:
+        return True
+    return any(role.id == int(required_role_id) for role in member.roles)
 
 
 @bot.event
 async def on_application_command_error(ctx: discord.ApplicationContext, error):
     if isinstance(error, discord.ext.commands.CheckFailure):
-        role_mention = f"<@&{BOT_REQUIRED_ROLE_ID}>" if BOT_REQUIRED_ROLE_ID else "the required role"
+        required_role_id = _get_guild_required_role(ctx.guild_id) if ctx.guild else None
+        role_mention = f"<@&{required_role_id}>" if required_role_id else "the required role"
         await ctx.respond(
             f"You need the {role_mention} role to use this bot.",
             ephemeral=True,
@@ -1161,6 +1164,26 @@ def _set_guild_channel(guild_id: int, channel_id: str) -> None:
         json.dump(cfg, f, indent=2)
 
 
+def _get_guild_required_role(guild_id: int) -> str | None:
+    try:
+        with open(_CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg.get("guild_required_roles", {}).get(str(guild_id))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _set_guild_required_role(guild_id: int, role_id: str) -> None:
+    try:
+        with open(_CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        cfg = {}
+    cfg.setdefault("guild_required_roles", {})[str(guild_id)] = role_id
+    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
 _TIME_RE = re.compile(
     r"^(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ampm>am|pm)?$",
     re.IGNORECASE,
@@ -1374,6 +1397,27 @@ async def set_daily_channel(
     _set_guild_channel(ctx.guild_id, str(channel.id))
     await ctx.respond(
         f"✓ Daily challenge channel set to {channel.mention}.",
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /set_required_role
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(
+    name="set_required_role",
+    description="Set the role required to use this bot in this server (admin only)",
+    guild_ids=guild_ids,
+)
+@discord.default_permissions(administrator=True)
+async def set_required_role(
+    ctx: discord.ApplicationContext,
+    role: discord.Option(discord.Role, description="Role required to use the bot. Admins always bypass this."),
+):
+    _set_guild_required_role(ctx.guild_id, str(role.id))
+    await ctx.respond(
+        f"✓ Bot access restricted to {role.mention} (and admins) in this server.",
         ephemeral=True,
     )
 

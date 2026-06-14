@@ -19,9 +19,6 @@ DISCORD_TOKEN=your_bot_token_here
 # or set to one guild ID for instant registration in that server only (useful for testing)
 DISCORD_GUILD_ID=your_guild_id_here
 
-# Optional: restrict all bot commands to users who have this role (admins always bypass)
-BOT_REQUIRED_ROLE_ID=role_id_here
-
 # Optional: role to ping in daily art prompt posts
 DAILY_ROLE_ID=role_id_here
 ```
@@ -47,7 +44,7 @@ Each server's channel configuration is stored independently in `config.json`. Da
 
 ## Access control
 
-Set `BOT_REQUIRED_ROLE_ID` in `.env` to restrict all commands to members with a specific role. Administrators always bypass this check regardless of role. Users without the required role receive an ephemeral error message.
+Run `/set_required_role` in a server to restrict all bot commands to members with a specific role. This is stored per-server in `config.json`, so each server can have a different required role (or none at all). Administrators always bypass the check. Users without the required role receive an ephemeral error message.
 
 ---
 
@@ -261,3 +258,12 @@ Set the forum channel where daily prompts will be posted for this server. Stored
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `channel` | required | The forum channel to post into |
+
+---
+
+### `/set_required_role`
+Restrict all bot commands in this server to members with a specific role. Stored per-server in `config.json`. Administrators always bypass this check. Run without a role restriction configured and anyone can use the bot.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `role` | required | The role allowed to use the bot |
