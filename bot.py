@@ -1,9 +1,15 @@
 import hashlib
 import io
+import json
 import os
+import random
+import re
 import traceback
+from datetime import datetime, timedelta
 
 import discord
+import pytz
+from discord.ext import tasks
 from dotenv import load_dotenv
 
 from analyzer import (
@@ -42,9 +48,26 @@ from analyzer import (
 )
 
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 guild_ids = [int(GUILD_ID)] if GUILD_ID else None
+
+DAILY_CHANNEL_ID = os.getenv("DAILY_CHALLENGE_CHANNEL_ID")
+DAILY_ROLE_ID    = os.getenv("DAILY_ROLE_ID")
+ET = pytz.timezone("America/New_York")
+
+_REFERENCES_FILE = os.path.join(os.path.dirname(__file__), "references.json")
+_SCHEDULE_FILE   = os.path.join(os.path.dirname(__file__), "daily_schedule.json")
+_CONFIG_FILE     = os.path.join(os.path.dirname(__file__), "config.json")
+
+# config.json can override .env channel ID (set via /set_daily_channel)
+try:
+    with open(_CONFIG_FILE, encoding="utf-8") as _f:
+        _cfg = json.load(_f)
+    if not DAILY_CHANNEL_ID and _cfg.get("DAILY_CHALLENGE_CHANNEL_ID"):
+        DAILY_CHANNEL_ID = _cfg["DAILY_CHALLENGE_CHANNEL_ID"]
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
 
 MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 
@@ -81,6 +104,7 @@ def _cache_set(data: bytes, n: int, sat: float, bri: float, colors, counts, stat
 @bot.event
 async def on_ready():
     print(f"Ready — logged in as {bot.user} (id: {bot.user.id})")
+    _post_scheduled_challenges.start()
 
 
 def _pct_bar(pct: float, width: int = 8) -> str:
@@ -1075,6 +1099,249 @@ async def help_cmd(
         embed.add_field(name="Parameters", value=param_lines, inline=False)
         embed.add_field(name="Output",     value=doc["output"], inline=False)
         await ctx.respond(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Daily challenge — helpers
+# ---------------------------------------------------------------------------
+
+def _load_references() -> list[str]:
+    try:
+        with open(_REFERENCES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _load_schedule() -> list[dict]:
+    try:
+        with open(_SCHEDULE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_schedule(challenges: list[dict]) -> None:
+    with open(_SCHEDULE_FILE, "w", encoding="utf-8") as f:
+        json.dump(challenges, f, indent=2)
+
+
+_TIME_RE = re.compile(
+    r"^(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ampm>am|pm)?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_release_time(time_str: str) -> str:
+    """Return an ISO-8601 datetime string in ET for the given time (today or tomorrow)."""
+    m = _TIME_RE.match(time_str.strip())
+    if not m:
+        raise ValueError(f"Cannot parse time: {time_str!r}")
+    h = int(m.group("h"))
+    mins = int(m.group("m") or 0)
+    ampm = (m.group("ampm") or "").lower()
+    if ampm == "pm" and h != 12:
+        h += 12
+    elif ampm == "am" and h == 12:
+        h = 0
+    now_et = datetime.now(ET)
+    target = now_et.replace(hour=h, minute=mins, second=0, microsecond=0)
+    if target <= now_et:
+        target += timedelta(days=1)
+    return target.isoformat()
+
+
+def _random_minimum_time() -> str:
+    minutes = random.randint(1, 15)
+    return f"{minutes} minute{'s' if minutes != 1 else ''}"
+
+
+def _format_daily_post(challenge: dict) -> str:
+    day         = challenge["day"]
+    description = challenge.get("description", "")
+    reference   = challenge.get("reference")
+    min_time    = challenge.get("minimum_time", "")
+    extra       = challenge.get("extra_challenge")
+
+    role_line = f"<@&{DAILY_ROLE_ID}>" if DAILY_ROLE_ID else ""
+
+    lines = [
+        "**DAILY ART PROMPT**",
+        "",
+        day,
+    ]
+    if role_line:
+        lines.append(role_line)
+    if description:
+        lines.append(description)
+    lines += ["", "□  □  □"]
+
+    if reference:
+        lines += ["", "**REFERENCE**", f"> {reference}"]
+
+    lines += ["", "**MINIMUM TIME**", f"> {min_time}"]
+
+    if extra:
+        lines += ["", "**EXTRA CHALLENGE**", f"> {extra}"]
+
+    lines += ["", "□  □  □"]
+    return "\n".join(lines)
+
+
+async def _send_daily_challenge(challenge: dict) -> None:
+    if not DAILY_CHANNEL_ID:
+        print("Daily challenge: DAILY_CHALLENGE_CHANNEL_ID not set, skipping.")
+        return
+    channel = bot.get_channel(int(DAILY_CHANNEL_ID))
+    if channel is None:
+        print(f"Daily challenge: channel {DAILY_CHANNEL_ID} not found.")
+        return
+    content = _format_daily_post(challenge)
+    try:
+        await channel.create_thread(
+            name=f"Daily Art Prompt — {challenge['day']}",
+            content=content,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# Daily challenge — background task
+# ---------------------------------------------------------------------------
+
+@tasks.loop(minutes=1)
+async def _post_scheduled_challenges() -> None:
+    if not DAILY_CHANNEL_ID:
+        return
+    now = datetime.now(ET)
+    schedule = _load_schedule()
+    remaining = []
+    for challenge in schedule:
+        post_at = datetime.fromisoformat(challenge["post_at"])
+        if now >= post_at:
+            await _send_daily_challenge(challenge)
+        else:
+            remaining.append(challenge)
+    if len(remaining) != len(schedule):
+        _save_schedule(remaining)
+
+
+# ---------------------------------------------------------------------------
+# /daily_challenge
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(
+    name="daily_challenge",
+    description="Schedule a daily art prompt thread in the configured forum channel",
+    guild_ids=guild_ids,
+)
+@discord.default_permissions(administrator=True)
+async def daily_challenge(
+    ctx: discord.ApplicationContext,
+    day: discord.Option(str, description='Label shown in the post header, e.g. "Day 42" or "Saturday"'),
+    description: discord.Option(str, description="The art prompt / challenge description"),
+    release_time: discord.Option(
+        str,
+        description='When to post (ET), e.g. "18:00", "6pm", "6:30pm". Defaults to 6pm.',
+        required=False,
+        default="18:00",
+    ),
+    reference: discord.Option(
+        str,
+        description="Discord image URL to use as reference. Omit to pick randomly from references.json.",
+        required=False,
+        default=None,
+    ),
+    minimum_time: discord.Option(
+        str,
+        description='Minimum time, e.g. "10 minutes". Omit for a random 1–15 min value.',
+        required=False,
+        default=None,
+    ),
+    extra_challenge: discord.Option(
+        str,
+        description="Optional extra challenge text.",
+        required=False,
+        default=None,
+    ),
+):
+    await ctx.defer(ephemeral=True)
+
+    try:
+        post_at_iso = _parse_release_time(release_time)
+    except ValueError as exc:
+        await ctx.followup.send(
+            f"Could not parse release time `{release_time}`. "
+            "Use formats like `18:00`, `6pm`, or `6:30pm`.",
+            ephemeral=True,
+        )
+        return
+
+    if minimum_time is None:
+        minimum_time = _random_minimum_time()
+
+    if reference is None:
+        refs = _load_references()
+        if refs:
+            reference = random.choice(refs)
+
+    challenge = {
+        "day":            day,
+        "description":    description,
+        "post_at":        post_at_iso,
+        "reference":      reference,
+        "minimum_time":   minimum_time,
+        "extra_challenge": extra_challenge,
+    }
+
+    schedule = _load_schedule()
+    schedule.append(challenge)
+    _save_schedule(schedule)
+
+    post_at_dt = datetime.fromisoformat(post_at_iso)
+    hour = post_at_dt.hour % 12 or 12
+    ampm = "AM" if post_at_dt.hour < 12 else "PM"
+    formatted_time = f"{hour}:{post_at_dt.minute:02d} {ampm} ET, {post_at_dt.strftime('%B')} {post_at_dt.day}"
+    await ctx.followup.send(
+        f"✓ Daily challenge scheduled for **{formatted_time}**.",
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /set_daily_channel
+# ---------------------------------------------------------------------------
+
+@bot.slash_command(
+    name="set_daily_channel",
+    description="Set the forum channel where daily art prompts will be posted (admin only)",
+    guild_ids=guild_ids,
+)
+@discord.default_permissions(administrator=True)
+async def set_daily_channel(
+    ctx: discord.ApplicationContext,
+    channel: discord.Option(discord.ForumChannel, description="The forum channel to post daily prompts in"),
+):
+    global DAILY_CHANNEL_ID
+    DAILY_CHANNEL_ID = str(channel.id)
+
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        cfg = {}
+    cfg["DAILY_CHALLENGE_CHANNEL_ID"] = DAILY_CHANNEL_ID
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+    await ctx.respond(
+        f"✓ Daily challenge channel set to {channel.mention}.",
+        ephemeral=True,
+    )
 
 
 if __name__ == "__main__":
