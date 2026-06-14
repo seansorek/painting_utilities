@@ -52,22 +52,13 @@ TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 guild_ids = [int(GUILD_ID)] if GUILD_ID else None
 
-DAILY_CHANNEL_ID = os.getenv("DAILY_CHALLENGE_CHANNEL_ID")
-DAILY_ROLE_ID    = os.getenv("DAILY_ROLE_ID")
+DAILY_ROLE_ID       = os.getenv("DAILY_ROLE_ID")
+BOT_REQUIRED_ROLE_ID = os.getenv("BOT_REQUIRED_ROLE_ID")
 ET = pytz.timezone("America/New_York")
 
 _REFERENCES_FILE = os.path.join(os.path.dirname(__file__), "references.json")
 _SCHEDULE_FILE   = os.path.join(os.path.dirname(__file__), "daily_schedule.json")
 _CONFIG_FILE     = os.path.join(os.path.dirname(__file__), "config.json")
-
-# config.json can override .env channel ID (set via /set_daily_channel)
-try:
-    with open(_CONFIG_FILE, encoding="utf-8") as _f:
-        _cfg = json.load(_f)
-    if not DAILY_CHANNEL_ID and _cfg.get("DAILY_CHALLENGE_CHANNEL_ID"):
-        DAILY_CHANNEL_ID = _cfg["DAILY_CHALLENGE_CHANNEL_ID"]
-except (FileNotFoundError, json.JSONDecodeError):
-    pass
 
 MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 
@@ -105,6 +96,28 @@ def _cache_set(data: bytes, n: int, sat: float, bri: float, colors, counts, stat
 async def on_ready():
     print(f"Ready — logged in as {bot.user} (id: {bot.user.id})")
     _post_scheduled_challenges.start()
+
+
+@bot.check
+async def _require_bot_role(ctx: discord.ApplicationContext) -> bool:
+    if not BOT_REQUIRED_ROLE_ID or not ctx.guild:
+        return True
+    member = ctx.author
+    if member.guild_permissions.administrator:
+        return True
+    return any(role.id == int(BOT_REQUIRED_ROLE_ID) for role in member.roles)
+
+
+@bot.event
+async def on_application_command_error(ctx: discord.ApplicationContext, error):
+    if isinstance(error, discord.ext.commands.CheckFailure):
+        role_mention = f"<@&{BOT_REQUIRED_ROLE_ID}>" if BOT_REQUIRED_ROLE_ID else "the required role"
+        await ctx.respond(
+            f"You need the {role_mention} role to use this bot.",
+            ephemeral=True,
+        )
+    else:
+        raise error
 
 
 def _pct_bar(pct: float, width: int = 8) -> str:
@@ -1128,6 +1141,26 @@ def _save_schedule(challenges: list[dict]) -> None:
         json.dump(challenges, f, indent=2)
 
 
+def _get_guild_channel(guild_id: int) -> str | None:
+    try:
+        with open(_CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg.get("guild_channels", {}).get(str(guild_id))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _set_guild_channel(guild_id: int, channel_id: str) -> None:
+    try:
+        with open(_CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        cfg = {}
+    cfg.setdefault("guild_channels", {})[str(guild_id)] = channel_id
+    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
 _TIME_RE = re.compile(
     r"^(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ampm>am|pm)?$",
     re.IGNORECASE,
@@ -1191,12 +1224,17 @@ def _format_daily_post(challenge: dict) -> str:
 
 
 async def _send_daily_challenge(challenge: dict) -> None:
-    if not DAILY_CHANNEL_ID:
-        print("Daily challenge: DAILY_CHALLENGE_CHANNEL_ID not set, skipping.")
+    guild_id = challenge.get("guild_id")
+    if not guild_id:
+        print("Daily challenge: missing guild_id, skipping.")
         return
-    channel = bot.get_channel(int(DAILY_CHANNEL_ID))
+    channel_id = _get_guild_channel(int(guild_id))
+    if not channel_id:
+        print(f"Daily challenge: no channel configured for guild {guild_id}, skipping.")
+        return
+    channel = bot.get_channel(int(channel_id))
     if channel is None:
-        print(f"Daily challenge: channel {DAILY_CHANNEL_ID} not found.")
+        print(f"Daily challenge: channel {channel_id} not found for guild {guild_id}.")
         return
     content = _format_daily_post(challenge)
     try:
@@ -1214,8 +1252,6 @@ async def _send_daily_challenge(challenge: dict) -> None:
 
 @tasks.loop(minutes=1)
 async def _post_scheduled_challenges() -> None:
-    if not DAILY_CHANNEL_ID:
-        return
     now = datetime.now(ET)
     schedule = _load_schedule()
     remaining = []
@@ -1288,7 +1324,17 @@ async def daily_challenge(
         if refs:
             reference = random.choice(refs)
 
+    channel_id = _get_guild_channel(ctx.guild_id)
+    if not channel_id:
+        await ctx.followup.send(
+            "No forum channel configured for this server. "
+            "An admin must run `/set_daily_channel` first.",
+            ephemeral=True,
+        )
+        return
+
     challenge = {
+        "guild_id":       str(ctx.guild_id),
         "day":            day,
         "description":    description,
         "post_at":        post_at_iso,
@@ -1325,19 +1371,7 @@ async def set_daily_channel(
     ctx: discord.ApplicationContext,
     channel: discord.Option(discord.ForumChannel, description="The forum channel to post daily prompts in"),
 ):
-    global DAILY_CHANNEL_ID
-    DAILY_CHANNEL_ID = str(channel.id)
-
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            cfg = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        cfg = {}
-    cfg["DAILY_CHALLENGE_CHANNEL_ID"] = DAILY_CHANNEL_ID
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
+    _set_guild_channel(ctx.guild_id, str(channel.id))
     await ctx.respond(
         f"✓ Daily challenge channel set to {channel.mention}.",
         ephemeral=True,
