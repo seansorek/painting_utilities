@@ -3,6 +3,9 @@
 Importing ``bot`` is safe: ``discord.Bot(...)`` is constructed at import but
 never connects, and ``bot.run()`` only executes under ``__main__``.
 """
+import asyncio
+from unittest.mock import MagicMock, patch, AsyncMock
+
 import pytest
 
 import bot
@@ -143,3 +146,46 @@ class TestCache:
         # _cache_set should not raise on StopIteration from next(iter({}))
         bot._cache_set(b"race_empty", 8, 0.0, 0.0, "a", "b", "c")
         assert bot._cache_get(b"race_empty", 8) == ("a", "b", "c")
+
+
+class TestOnReadyGuard:
+    """Verify that on_ready guards _post_scheduled_challenges.start() with is_running()."""
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _patch_bot_user(self):
+        """Return a context manager that makes bot.bot.user a non-None mock.
+
+        discord.Bot.user is a property backed by _connection._state.user, so we
+        patch the underlying attribute directly on the live instance via __dict__
+        of the class, using patch.object with new_callable=PropertyMock.
+        """
+        from unittest.mock import PropertyMock
+        mock_user = MagicMock()
+        mock_user.id = 123
+        return patch.object(type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_user)
+
+    def test_start_not_called_when_already_running(self):
+        """If the loop reports is_running() == True, start() must NOT be called."""
+        mock_loop = MagicMock()
+        mock_loop.is_running.return_value = True
+
+        with patch.object(bot, "_post_scheduled_challenges", mock_loop):
+            with self._patch_bot_user():
+                self._run(bot.on_ready())
+
+        mock_loop.is_running.assert_called_once()
+        mock_loop.start.assert_not_called()
+
+    def test_start_called_when_not_running(self):
+        """If the loop reports is_running() == False, start() must be called exactly once."""
+        mock_loop = MagicMock()
+        mock_loop.is_running.return_value = False
+
+        with patch.object(bot, "_post_scheduled_challenges", mock_loop):
+            with self._patch_bot_user():
+                self._run(bot.on_ready())
+
+        mock_loop.is_running.assert_called_once()
+        mock_loop.start.assert_called_once()

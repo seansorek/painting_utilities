@@ -96,7 +96,8 @@ def _cache_set(data: bytes, n: int, sat: float, bri: float, colors, counts, stat
 @bot.event
 async def on_ready():
     print(f"Ready — logged in as {bot.user} (id: {bot.user.id})")
-    _post_scheduled_challenges.start()
+    if not _post_scheduled_challenges.is_running():
+        _post_scheduled_challenges.start()
 
 
 def _is_guild_admin(member: discord.Member) -> bool:
