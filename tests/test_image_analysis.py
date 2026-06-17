@@ -119,6 +119,26 @@ class TestComputeStats:
         assert 0 <= lo < 360
         assert 0 <= hi < 360
 
+    def test_grayscale_image_dominant_hue_none(self):
+        """Desaturated (gray) pixels should not produce a spurious hue."""
+        gray = make_solid_image((128, 128, 128))
+        stats = compute_stats(gray)
+        assert stats["dominant_hue_range"] == (None, None)
+
+    def test_saturated_image_dominant_hue_covers_expected_range(self):
+        """A solid saturated color should fall within the dominant hue range."""
+        # Pure blue: RGB (0, 0, 255) → HSV hue ≈ 240°
+        blue = make_solid_image((0, 0, 255))
+        stats = compute_stats(blue)
+        lo, hi = stats["dominant_hue_range"]
+        assert lo is not None and hi is not None
+        # The 60° window should contain 240°
+        if lo < hi:
+            assert lo <= 240 <= hi
+        else:
+            # Wraps around 360
+            assert 240 >= lo or 240 <= hi
+
 
 class TestAdjustImage:
     def test_no_change_returns_same_size(self):

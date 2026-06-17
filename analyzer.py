@@ -356,15 +356,22 @@ def compute_stats(img: Image.Image) -> dict:
     sat_vals = hsv[:, :, 1].flatten()
     mean_sat_pct = sat_vals.mean() / 255 * 100
 
-    hue_deg = hue_vals.astype(float) / 255 * 360
-    hist, edges = np.histogram(hue_deg, bins=36, range=(0, 360))
-    best_start, best_sum = 0, -1
-    for i in range(36):
-        window = sum(hist[(i + j) % 36] for j in range(6))
-        if window > best_sum:
-            best_sum, best_start = window, i
-    dom_hue_start = int(edges[best_start])
-    dom_hue_end = (dom_hue_start + 60) % 360
+    val_vals = hsv[:, :, 2].flatten()
+    mask = (sat_vals / 255 >= 0.15) & (val_vals / 255 >= 0.10)
+    filtered_hue = hue_vals[mask]
+
+    if len(filtered_hue) == 0:
+        dom_hue_start, dom_hue_end = None, None
+    else:
+        hue_deg = filtered_hue.astype(float) / 255 * 360
+        hist, edges = np.histogram(hue_deg, bins=36, range=(0, 360))
+        best_start, best_sum = 0, -1
+        for i in range(36):
+            window = sum(hist[(i + j) % 36] for j in range(6))
+            if window > best_sum:
+                best_sum, best_start = window, i
+        dom_hue_start = int(edges[best_start])
+        dom_hue_end = (dom_hue_start + 60) % 360
 
     return {
         "width": img.width,
