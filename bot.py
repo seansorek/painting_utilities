@@ -1449,27 +1449,30 @@ def _format_daily_post(challenge: dict) -> str:
     return "\n".join(lines)
 
 
-async def _send_daily_challenge(challenge: dict) -> None:
+async def _send_daily_challenge(challenge: dict) -> bool:
+    """Post a single scheduled challenge. Returns True on success, False on failure."""
     guild_id = challenge.get("guild_id")
     if not guild_id:
         print("Daily challenge: missing guild_id, skipping.")
-        return
+        return False
     channel_id = _get_guild_channel(int(guild_id))
     if not channel_id:
         print(f"Daily challenge: no channel configured for guild {guild_id}, skipping.")
-        return
+        return False
     channel = bot.get_channel(int(channel_id))
     if channel is None:
         print(f"Daily challenge: channel {channel_id} not found for guild {guild_id}.")
-        return
+        return False
     content = _format_daily_post(challenge)
     try:
         await channel.create_thread(
             name=f"Daily Art Prompt — {challenge['day']}",
             content=content,
         )
+        return True
     except Exception:
         traceback.print_exc()
+        return False
 
 
 # ---------------------------------------------------------------------------
