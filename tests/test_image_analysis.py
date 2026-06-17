@@ -1,9 +1,13 @@
 """Tests for image loading, color extraction, stats, and adjustment."""
+import io
+
 import numpy as np
 import pytest
 from PIL import Image
 
+import analyzer
 from analyzer import (
+    MAX_WORKING_DIM,
     load_image_from_bytes,
     extract_dominant_colors,
     compute_stats,
@@ -32,6 +36,27 @@ class TestLoadImageFromBytes:
     def test_invalid_bytes_raises(self):
         with pytest.raises(Exception):
             load_image_from_bytes(b"not an image")
+
+    def test_small_image_not_resized(self, png_bytes):
+        img = make_solid_image((10, 20, 30), size=(64, 48))
+        loaded = load_image_from_bytes(png_bytes(img))
+        assert loaded.size == (64, 48)
+
+    def test_oversized_image_downscaled_to_working_dim(self, png_bytes):
+        # Longest edge exceeds MAX_WORKING_DIM but pixel count stays tiny.
+        wide = Image.new("RGB", (MAX_WORKING_DIM + 1000, 10), (50, 100, 150))
+        loaded = load_image_from_bytes(png_bytes(wide))
+        assert max(loaded.size) == MAX_WORKING_DIM
+        # Aspect ratio preserved (very wide image stays very wide).
+        assert loaded.width > loaded.height
+
+    def test_decompression_bomb_rejected(self, png_bytes, monkeypatch):
+        # Lower the pixel cap so a small test image trips the guard, proving an
+        # over-large image is rejected before its raster is fully processed.
+        monkeypatch.setattr(analyzer, "MAX_IMAGE_PIXELS", 100)
+        bomb = make_solid_image((0, 0, 0), size=(64, 64))  # 4096 px > 100
+        with pytest.raises(ValueError, match="too large"):
+            load_image_from_bytes(png_bytes(bomb))
 
 
 class TestExtractDominantColors:

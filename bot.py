@@ -1,18 +1,23 @@
+import asyncio
+import functools
 import hashlib
 import io
 import json
 import os
 import random
 import re
+import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import discord
 import pytz
-from discord.ext import tasks
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from analyzer import (
+    MAX_IMAGE_PIXELS,
     load_image_from_bytes,
     extract_dominant_colors,
     compute_stats,
@@ -49,8 +54,31 @@ from analyzer import (
 
 load_dotenv()
 TOKEN    = os.getenv("DISCORD_TOKEN")
+
+
+def _parse_dev_guild_ids(raw: str | None) -> list[int] | None:
+    """Parse DISCORD_GUILD_ID.
+
+    DISCORD_GUILD_ID is a *development-only* fast-sync override: when set, slash
+    commands register to that single guild and appear instantly. For public
+    (multi-server) use it must be left UNSET so commands register globally and
+    show up in every server the bot is invited to. A malformed value must not
+    crash startup — we warn and fall back to global registration.
+    """
+    if not raw:
+        return None
+    try:
+        return [int(raw)]
+    except ValueError:
+        print(
+            f"Warning: DISCORD_GUILD_ID={raw!r} is not a valid integer; "
+            "ignoring and registering commands globally."
+        )
+        return None
+
+
 GUILD_ID = os.getenv("DISCORD_GUILD_ID")
-guild_ids = [int(GUILD_ID)] if GUILD_ID else None
+guild_ids = _parse_dev_guild_ids(GUILD_ID)
 
 ET = pytz.timezone("America/New_York")
 
@@ -60,7 +88,50 @@ _CONFIG_FILE     = os.path.join(os.path.dirname(__file__), "config.json")
 
 MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 
-bot = discord.Bot(intents=discord.Intents.default())
+# message_content is intentionally NOT enabled: it is a privileged intent (needs
+# Discord approval + verification at 100 servers) and nothing here reads message
+# text — on_message only inspects attachments, which arrive without the intent.
+_intents = discord.Intents.default()
+bot = discord.Bot(intents=_intents)
+
+# ---------------------------------------------------------------------------
+# CPU offload + concurrency / rate limiting
+#
+# All heavy image work (PIL decode, KMeans, numpy, matplotlib) is blocking. A
+# single dedicated worker thread keeps the event loop responsive (so the bot
+# stays live for every other server while one image is processed) AND confines
+# all matplotlib/pyplot access to one thread (pyplot's global state is not
+# thread-safe). max_workers=1 therefore also bounds concurrent heavy jobs to one
+# process-wide — a natural throttle against abuse.
+# ---------------------------------------------------------------------------
+_CPU_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="img-worker")
+
+# Per-user cooldown on expensive commands (seconds). Configurable via env.
+_COOLDOWN_SECONDS = float(os.getenv("COMMAND_COOLDOWN_SECONDS", "5"))
+_USER_COOLDOWNS: dict[int, float] = {}
+
+# Commands subject to CPU offload + cooldown (the image/render-heavy ones).
+_HEAVY_COMMANDS = frozenset({
+    "analyze", "palette", "gradient_map", "palette_gradient",
+    "export_palette", "export_gradient", "color_info", "compare",
+    "colorblind", "recolor", "suggest_harmony",
+})
+
+
+async def _run_cpu(func, *args, **kwargs):
+    """Run a blocking CPU-bound callable on the dedicated image worker thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _CPU_EXECUTOR, functools.partial(func, *args, **kwargs)
+    )
+
+
+class _CooldownError(commands.CheckFailure):
+    """Raised when a user invokes a heavy command before their cooldown expires."""
+
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f"On cooldown for {retry_after:.1f}s")
 
 # ---------------------------------------------------------------------------
 # Result cache — keyed by (sha1(image_bytes), n_colors, sat_boost, bri_boost)
@@ -123,9 +194,33 @@ async def _require_bot_role(ctx: discord.ApplicationContext) -> bool:
     )
 
 
+@bot.check
+async def _cooldown_check(ctx: discord.ApplicationContext) -> bool:
+    """Per-user rate limit on the expensive image commands.
+
+    Runs after _require_bot_role (registered first), so cooldown is only spent
+    by users who are actually allowed to run the command.
+    """
+    if ctx.command is None or ctx.command.name not in _HEAVY_COMMANDS:
+        return True
+    now = time.monotonic()
+    last = _USER_COOLDOWNS.get(ctx.author.id, 0.0)
+    remaining = _COOLDOWN_SECONDS - (now - last)
+    if remaining > 0:
+        raise _CooldownError(remaining)
+    _USER_COOLDOWNS[ctx.author.id] = now
+    return True
+
+
 @bot.event
 async def on_application_command_error(ctx: discord.ApplicationContext, error):
-    if isinstance(error, discord.ext.commands.CheckFailure):
+    if isinstance(error, _CooldownError):
+        await ctx.respond(
+            f"You're using commands too quickly — try again in "
+            f"{error.retry_after:.0f}s.",
+            ephemeral=True,
+        )
+    elif isinstance(error, commands.CheckFailure):
         required_role_id = _get_guild_required_role(ctx.guild_id) if ctx.guild else None
         role_mention = f"<@&{required_role_id}>" if required_role_id else "the required role"
         await ctx.respond(
@@ -134,6 +229,22 @@ async def on_application_command_error(ctx: discord.ApplicationContext, error):
         )
     else:
         raise error
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot:
+        return
+    if not isinstance(message.channel, discord.Thread) or not message.guild:
+        return
+    channel_id = _get_guild_channel(message.guild.id)
+    if not channel_id or message.channel.parent_id != int(channel_id):
+        return
+    if any(
+        a.content_type and a.content_type.startswith("image/")
+        for a in message.attachments
+    ):
+        await message.add_reaction("⭐")
 
 
 def _pct_bar(pct: float, width: int = 8) -> str:
@@ -181,14 +292,33 @@ def _color_line(rgb, cnt, total, show_rgb: bool, show_cmyk: bool) -> str:
     return line
 
 
-async def _validate_image(ctx, image) -> bool:
+def _image_rejection_reason(image) -> str | None:
+    """Validate an attachment, returning an error string or None if it's OK.
+
+    Shared by all image commands so validation is identical everywhere. The
+    pixel-dimension check uses Discord's attachment metadata to reject
+    decompression bombs *before* download; load_image_from_bytes enforces the
+    same MAX_IMAGE_PIXELS limit again on the decoded raster as defense in depth.
+    """
     if not image.content_type or not image.content_type.startswith("image/"):
-        await ctx.followup.send("Please attach an image file (PNG, JPEG, etc.).")
-        return False
+        return f"`{image.filename}` is not a valid image file (PNG, JPEG, etc.)."
     if image.size > MAX_FILE_BYTES:
-        await ctx.followup.send(
-            f"Image is too large (max 15 MB). Yours is {image.size / 1e6:.1f} MB."
+        return (
+            f"`{image.filename}` is too large (max 15 MB). "
+            f"It's {image.size / 1e6:.1f} MB."
         )
+    if image.width and image.height and image.width * image.height > MAX_IMAGE_PIXELS:
+        return (
+            f"`{image.filename}` has too many pixels "
+            f"({image.width}×{image.height}); max is {MAX_IMAGE_PIXELS:,}."
+        )
+    return None
+
+
+async def _validate_image(ctx, image) -> bool:
+    reason = _image_rejection_reason(image)
+    if reason:
+        await ctx.followup.send(reason)
         return False
     return True
 
@@ -263,23 +393,28 @@ async def analyze(
         return
     try:
         data = await image.read()
-        cached = _cache_get(data, num_colors, saturation_boost, brightness_boost)
-        if cached:
-            colors, counts, stats = cached
-            img = load_image_from_bytes(data)
-            if saturation_boost != 0.0 or brightness_boost != 0.0:
-                img = adjust_image(img, saturation_boost, brightness_boost)
-        else:
-            img = load_image_from_bytes(data)
-            if saturation_boost != 0.0 or brightness_boost != 0.0:
-                img = adjust_image(img, saturation_boost, brightness_boost)
-            colors, counts = extract_dominant_colors(img, n=num_colors)
-            stats = compute_stats(img)
-            _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
+
+        def _work():
+            cached = _cache_get(data, num_colors, saturation_boost, brightness_boost)
+            if cached:
+                colors, counts, stats = cached
+                img = load_image_from_bytes(data)
+                if saturation_boost != 0.0 or brightness_boost != 0.0:
+                    img = adjust_image(img, saturation_boost, brightness_boost)
+            else:
+                img = load_image_from_bytes(data)
+                if saturation_boost != 0.0 or brightness_boost != 0.0:
+                    img = adjust_image(img, saturation_boost, brightness_boost)
+                colors, counts = extract_dominant_colors(img, n=num_colors)
+                stats = compute_stats(img)
+                _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
+            palette_buf = render_chart_to_bytesio(render_palette_chart(colors, counts))
+            hue_sat_buf = render_chart_to_bytesio(render_hue_saturation_chart(img))
+            return colors, counts, stats, palette_buf, hue_sat_buf
+
+        colors, counts, stats, palette_buf, hue_sat_buf = await _run_cpu(_work)
 
         grayscale_warning = stats["mean_saturation_pct"] < 15
-        palette_buf  = render_chart_to_bytesio(render_palette_chart(colors, counts))
-        hue_sat_buf  = render_chart_to_bytesio(render_hue_saturation_chart(img))
         embed = _build_stats_embed(stats, colors, counts, image.filename, grayscale_warning, show_rgb, show_cmyk)
 
         if saturation_boost != 0.0 or brightness_boost != 0.0:
@@ -324,18 +459,22 @@ async def palette(
         return
     try:
         data = await image.read()
-        cached = _cache_get(data, num_colors, saturation_boost, brightness_boost)
-        if cached:
-            colors, counts, _ = cached
-        else:
-            img = load_image_from_bytes(data)
-            if saturation_boost != 0.0 or brightness_boost != 0.0:
-                img = adjust_image(img, saturation_boost, brightness_boost)
-            colors, counts = extract_dominant_colors(img, n=num_colors)
-            stats = compute_stats(img)
-            _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
 
-        palette_buf = render_chart_to_bytesio(render_palette_chart(colors, counts))
+        def _work():
+            cached = _cache_get(data, num_colors, saturation_boost, brightness_boost)
+            if cached:
+                colors, counts, _ = cached
+            else:
+                img = load_image_from_bytes(data)
+                if saturation_boost != 0.0 or brightness_boost != 0.0:
+                    img = adjust_image(img, saturation_boost, brightness_boost)
+                colors, counts = extract_dominant_colors(img, n=num_colors)
+                stats = compute_stats(img)
+                _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
+            palette_buf = render_chart_to_bytesio(render_palette_chart(colors, counts))
+            return colors, counts, palette_buf
+
+        colors, counts, palette_buf = await _run_cpu(_work)
         total = counts.sum()
         lines = [_color_line(rgb, cnt, total, show_rgb, show_cmyk) for rgb, cnt in zip(colors, counts)]
         embed = discord.Embed(
@@ -411,14 +550,17 @@ async def gradient_map_cmd(
 
     try:
         data = await image.read()
-        img = load_image_from_bytes(data)
-        result = apply_gradient_map(img, gradient_stops)
 
-        out_buf = io.BytesIO()
-        result.save(out_buf, format="PNG")
-        out_buf.seek(0)
+        def _work():
+            img = load_image_from_bytes(data)
+            result = apply_gradient_map(img, gradient_stops)
+            out_buf = io.BytesIO()
+            result.save(out_buf, format="PNG")
+            out_buf.seek(0)
+            swatch_buf = render_gradient_preview(gradient_stops)
+            return img, out_buf, swatch_buf
 
-        swatch_buf = render_gradient_preview(gradient_stops)
+        img, out_buf, swatch_buf = await _run_cpu(_work)
         embed = _build_gradient_embed(image.filename, gradient_label, img, gradient_stops)
 
         await ctx.followup.send(
@@ -454,19 +596,21 @@ async def palette_gradient_cmd(
         return
     try:
         data = await image.read()
-        img = load_image_from_bytes(data)
-        colors, counts = extract_dominant_colors(img, n=num_colors)
-        gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
 
-        if reverse:
-            gradient_stops = reverse_gradient(gradient_stops)
+        def _work():
+            img = load_image_from_bytes(data)
+            colors, counts = extract_dominant_colors(img, n=num_colors)
+            gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
+            if reverse:
+                gradient_stops = reverse_gradient(gradient_stops)
+            result = apply_gradient_map(img, gradient_stops)
+            out_buf = io.BytesIO()
+            result.save(out_buf, format="PNG")
+            out_buf.seek(0)
+            swatch_buf = render_gradient_preview(gradient_stops)
+            return colors, gradient_stops, img, out_buf, swatch_buf
 
-        result = apply_gradient_map(img, gradient_stops)
-        out_buf = io.BytesIO()
-        result.save(out_buf, format="PNG")
-        out_buf.seek(0)
-
-        swatch_buf = render_gradient_preview(gradient_stops)
+        colors, gradient_stops, img, out_buf, swatch_buf = await _run_cpu(_work)
         stop_colors = " → ".join(f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in sorted(gradient_stops))
         embed = discord.Embed(
             title=f"Palette Gradient — {image.filename}",
@@ -513,8 +657,12 @@ async def export_palette_cmd(
         return
     try:
         data = await image.read()
-        img = load_image_from_bytes(data)
-        colors, counts = extract_dominant_colors(img, n=num_colors)
+
+        def _work():
+            img = load_image_from_bytes(data)
+            return extract_dominant_colors(img, n=num_colors)
+
+        colors, counts = await _run_cpu(_work)
         color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
 
         format_map = {
@@ -575,11 +723,17 @@ async def export_gradient_cmd(
         return
     try:
         data = await image.read()
-        img = load_image_from_bytes(data)
-        colors, counts = extract_dominant_colors(img, n=num_colors)
-        gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
-        if reverse:
-            gradient_stops = reverse_gradient(gradient_stops)
+
+        def _work():
+            img = load_image_from_bytes(data)
+            colors, counts = extract_dominant_colors(img, n=num_colors)
+            gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
+            if reverse:
+                gradient_stops = reverse_gradient(gradient_stops)
+            swatch_buf = render_gradient_preview(gradient_stops)
+            return colors, gradient_stops, swatch_buf
+
+        colors, gradient_stops, swatch_buf = await _run_cpu(_work)
 
         if format == "ggr":
             file_bytes = export_gradient_ggr(gradient_stops, name=gradient_name)
@@ -587,8 +741,6 @@ async def export_gradient_cmd(
         else:
             file_bytes = export_gradient_json(gradient_stops, name=gradient_name)
             filename = f"{gradient_name}.json"
-
-        swatch_buf = render_gradient_preview(gradient_stops)
         stop_colors = " → ".join(f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in sorted(gradient_stops))
         embed = discord.Embed(
             title=f"Gradient Export — {image.filename}",
@@ -660,7 +812,7 @@ async def color_info_cmd(
             (_hue_rgb(h_f - 1 / 12), "Analogous -30°"),
         ]
 
-        swatch_buf = render_color_info_swatch((r, g, b), harmonies)
+        swatch_buf = await _run_cpu(render_color_info_swatch, (r, g, b), harmonies)
 
         embed = discord.Embed(
             title=f"Color Info — {hex_str}",
@@ -703,28 +855,27 @@ async def compare_cmd(
 ):
     await ctx.defer()
     for att in (image_a, image_b):
-        if not att.content_type or not att.content_type.startswith("image/"):
-            await ctx.followup.send(f"`{att.filename}` is not a valid image file.")
-            return
-        if att.size > MAX_FILE_BYTES:
-            await ctx.followup.send(f"`{att.filename}` exceeds the 15 MB limit.")
+        reason = _image_rejection_reason(att)
+        if reason:
+            await ctx.followup.send(reason)
             return
 
     try:
         data_a = await image_a.read()
         data_b = await image_b.read()
 
-        img_a = load_image_from_bytes(data_a)
-        img_b = load_image_from_bytes(data_b)
+        def _work():
+            img_a = load_image_from_bytes(data_a)
+            img_b = load_image_from_bytes(data_b)
+            colors_a, counts_a = extract_dominant_colors(img_a, n=num_colors)
+            colors_b, counts_b = extract_dominant_colors(img_b, n=num_colors)
+            compare_buf = render_compare_chart(
+                colors_a, counts_a, image_a.filename,
+                colors_b, counts_b, image_b.filename,
+            )
+            return colors_a, counts_a, colors_b, counts_b, compare_buf
 
-        colors_a, counts_a = extract_dominant_colors(img_a, n=num_colors)
-        colors_b, counts_b = extract_dominant_colors(img_b, n=num_colors)
-
-        compare_buf = render_compare_chart(
-            colors_a, counts_a, image_a.filename,
-            colors_b, counts_b, image_b.filename,
-        )
-
+        colors_a, counts_a, colors_b, counts_b, compare_buf = await _run_cpu(_work)
         total_a, total_b = counts_a.sum(), counts_b.sum()
 
         def _top_hex(colors, counts, total):
@@ -771,7 +922,6 @@ async def colorblind_cmd(
         return
     try:
         data = await image.read()
-        img = load_image_from_bytes(data)
 
         type_labels = {
             "deuteranopia": "Deuteranopia (red-green, missing green)",
@@ -779,15 +929,22 @@ async def colorblind_cmd(
             "tritanopia":   "Tritanopia (blue-yellow, missing blue)",
         }
 
+        def _work():
+            img = load_image_from_bytes(data)
+            if type == "all":
+                return img, render_colorblind_comparison(img)
+            sim = simulate_colorblindness(img, type)
+            buf = io.BytesIO()
+            sim.save(buf, format="PNG")
+            buf.seek(0)
+            return img, buf
+
+        img, result_buf = await _run_cpu(_work)
+
         if type == "all":
-            result_buf = render_colorblind_comparison(img)
             filename = "colorblind_all.png"
             type_label = "All types (4-panel comparison)"
         else:
-            sim = simulate_colorblindness(img, type)
-            result_buf = io.BytesIO()
-            sim.save(result_buf, format="PNG")
-            result_buf.seek(0)
             filename = f"colorblind_{type}.png"
             type_label = type_labels[type]
 
@@ -824,29 +981,28 @@ async def recolor_cmd(
 ):
     await ctx.defer()
     for att in (source, target):
-        if not att.content_type or not att.content_type.startswith("image/"):
-            await ctx.followup.send(f"`{att.filename}` is not a valid image file.")
-            return
-        if att.size > MAX_FILE_BYTES:
-            await ctx.followup.send(f"`{att.filename}` exceeds the 15 MB limit.")
+        reason = _image_rejection_reason(att)
+        if reason:
+            await ctx.followup.send(reason)
             return
 
     try:
         src_data = await source.read()
         tgt_data = await target.read()
 
-        src_img = load_image_from_bytes(src_data)
-        tgt_img = load_image_from_bytes(tgt_data)
+        def _work():
+            src_img = load_image_from_bytes(src_data)
+            tgt_img = load_image_from_bytes(tgt_data)
+            colors, _counts = extract_dominant_colors(src_img, n=num_colors)
+            color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
+            result = recolor_image(tgt_img, color_list)
+            out_buf = io.BytesIO()
+            result.save(out_buf, format="PNG")
+            out_buf.seek(0)
+            return color_list, out_buf, result.width, result.height
 
-        colors, counts = extract_dominant_colors(src_img, n=num_colors)
-        color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
+        color_list, out_buf, result_w, result_h = await _run_cpu(_work)
 
-        result = recolor_image(tgt_img, color_list)
-        out_buf = io.BytesIO()
-        result.save(out_buf, format="PNG")
-        out_buf.seek(0)
-
-        total = counts.sum()
         palette_lines = "  ".join(
             f"`#{r:02X}{g:02X}{b:02X}`" for r, g, b in color_list[:8]
         )
@@ -859,7 +1015,7 @@ async def recolor_cmd(
                         value=f"From **{source.filename}** ({num_colors} colors)\n{palette_lines}",
                         inline=False)
         embed.add_field(name="Output Size",
-                        value=f"{result.width} × {result.height} px", inline=True)
+                        value=f"{result_w} × {result_h} px", inline=True)
         embed.set_image(url="attachment://recolor.png")
 
         await ctx.followup.send(
@@ -889,18 +1045,24 @@ async def suggest_harmony_cmd(
         return
     try:
         data = await image.read()
-        img = load_image_from_bytes(data)
-        colors, counts = extract_dominant_colors(img, n=num_colors)
-        palette_type, suggestions = suggest_harmony_colors(colors, counts)
+
+        def _work():
+            img = load_image_from_bytes(data)
+            colors, counts = extract_dominant_colors(img, n=num_colors)
+            palette_type, suggestions = suggest_harmony_colors(colors, counts)
+            if not suggestions:
+                return palette_type, suggestions, None, None
+            orig_list = [tuple(int(v) for v in c) for c in colors]
+            harmony_buf = render_harmony_chart(orig_list, suggestions)
+            return palette_type, suggestions, orig_list, harmony_buf
+
+        palette_type, suggestions, orig_list, harmony_buf = await _run_cpu(_work)
 
         if not suggestions:
             await ctx.followup.send(
                 "Could not determine harmony suggestions — the palette may be mostly grayscale."
             )
             return
-
-        orig_list = [tuple(int(v) for v in c) for c in colors]
-        harmony_buf = render_harmony_chart(orig_list, suggestions)
 
         sugg_text = "\n".join(
             f"`#{r:02X}{g:02X}{b:02X}` **{nearest_color_name((r,g,b))}** — {lbl}"
@@ -1134,6 +1296,46 @@ async def help_cmd(
 # Daily challenge — helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Persistence
+#
+# Single-process state. Config is cached in memory (so the hot path — e.g.
+# on_message — never touches disk), and every write is atomic (temp file +
+# os.replace) and serialized behind an asyncio.Lock so concurrent handlers and
+# the background loop can't clobber each other's writes. (A SQLite/aiosqlite
+# datastore is the next step if the bot is ever run as multiple instances.)
+# ---------------------------------------------------------------------------
+
+_CONFIG_LOCK = asyncio.Lock()
+_SCHEDULE_LOCK = asyncio.Lock()
+_config_cache: dict | None = None
+
+
+def _atomic_write_json(path: str, data) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)  # atomic on POSIX and Windows
+
+
+def _config() -> dict:
+    """Return the in-memory config, loading it from disk once on first use."""
+    global _config_cache
+    if _config_cache is None:
+        try:
+            with open(_CONFIG_FILE, encoding="utf-8") as f:
+                loaded = json.load(f)
+            _config_cache = loaded if isinstance(loaded, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            _config_cache = {}
+    return _config_cache
+
+
+async def _persist_config() -> None:
+    async with _CONFIG_LOCK:
+        _atomic_write_json(_CONFIG_FILE, _config())
+
+
 def _load_references() -> list[str]:
     try:
         with open(_REFERENCES_FILE, encoding="utf-8") as f:
@@ -1153,68 +1355,34 @@ def _load_schedule() -> list[dict]:
 
 
 def _save_schedule(challenges: list[dict]) -> None:
-    with open(_SCHEDULE_FILE, "w", encoding="utf-8") as f:
-        json.dump(challenges, f, indent=2)
+    _atomic_write_json(_SCHEDULE_FILE, challenges)
 
 
 def _get_guild_channel(guild_id: int) -> str | None:
-    try:
-        with open(_CONFIG_FILE, encoding="utf-8") as f:
-            cfg = json.load(f)
-        return cfg.get("guild_channels", {}).get(str(guild_id))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+    return _config().get("guild_channels", {}).get(str(guild_id))
 
 
-def _set_guild_channel(guild_id: int, channel_id: str) -> None:
-    try:
-        with open(_CONFIG_FILE, encoding="utf-8") as f:
-            cfg = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        cfg = {}
-    cfg.setdefault("guild_channels", {})[str(guild_id)] = channel_id
-    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+async def _set_guild_channel(guild_id: int, channel_id: str) -> None:
+    _config().setdefault("guild_channels", {})[str(guild_id)] = channel_id
+    await _persist_config()
 
 
 def _get_guild_required_role(guild_id: int) -> str | None:
-    try:
-        with open(_CONFIG_FILE, encoding="utf-8") as f:
-            cfg = json.load(f)
-        return cfg.get("guild_required_roles", {}).get(str(guild_id))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+    return _config().get("guild_required_roles", {}).get(str(guild_id))
 
 
-def _set_guild_required_role(guild_id: int, role_id: str) -> None:
-    try:
-        with open(_CONFIG_FILE, encoding="utf-8") as f:
-            cfg = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        cfg = {}
-    cfg.setdefault("guild_required_roles", {})[str(guild_id)] = role_id
-    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+async def _set_guild_required_role(guild_id: int, role_id: str) -> None:
+    _config().setdefault("guild_required_roles", {})[str(guild_id)] = role_id
+    await _persist_config()
 
 
 def _get_guild_daily_role(guild_id: int) -> str | None:
-    try:
-        with open(_CONFIG_FILE, encoding="utf-8") as f:
-            cfg = json.load(f)
-        return cfg.get("guild_daily_roles", {}).get(str(guild_id))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+    return _config().get("guild_daily_roles", {}).get(str(guild_id))
 
 
-def _set_guild_daily_role(guild_id: int, role_id: str) -> None:
-    try:
-        with open(_CONFIG_FILE, encoding="utf-8") as f:
-            cfg = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        cfg = {}
-    cfg.setdefault("guild_daily_roles", {})[str(guild_id)] = role_id
-    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+async def _set_guild_daily_role(guild_id: int, role_id: str) -> None:
+    _config().setdefault("guild_daily_roles", {})[str(guild_id)] = role_id
+    await _persist_config()
 
 
 _TIME_RE = re.compile(
@@ -1311,16 +1479,23 @@ async def _send_daily_challenge(challenge: dict) -> None:
 @tasks.loop(minutes=1)
 async def _post_scheduled_challenges() -> None:
     now = datetime.now(ET)
-    schedule = _load_schedule()
-    remaining = []
-    for challenge in schedule:
-        post_at = datetime.fromisoformat(challenge["post_at"])
-        if now >= post_at:
-            await _send_daily_challenge(challenge)
-        else:
-            remaining.append(challenge)
-    if len(remaining) != len(schedule):
-        _save_schedule(remaining)
+    # Decide what's due and persist the remainder under the lock, then do the
+    # (slow, network-bound) sends outside it — so a concurrent /daily_challenge
+    # can't have its append clobbered by this loop's save.
+    async with _SCHEDULE_LOCK:
+        schedule = _load_schedule()
+        due, remaining = [], []
+        for challenge in schedule:
+            try:
+                post_at = datetime.fromisoformat(challenge["post_at"])
+            except (KeyError, ValueError):
+                traceback.print_exc()  # drop malformed entry
+                continue
+            (due if now >= post_at else remaining).append(challenge)
+        if len(remaining) != len(schedule):
+            _save_schedule(remaining)
+    for challenge in due:
+        await _send_daily_challenge(challenge)
 
 
 # ---------------------------------------------------------------------------
@@ -1401,9 +1576,10 @@ async def daily_challenge(
         "extra_challenge": extra_challenge,
     }
 
-    schedule = _load_schedule()
-    schedule.append(challenge)
-    _save_schedule(schedule)
+    async with _SCHEDULE_LOCK:
+        schedule = _load_schedule()
+        schedule.append(challenge)
+        _save_schedule(schedule)
 
     post_at_dt = datetime.fromisoformat(post_at_iso)
     hour = post_at_dt.hour % 12 or 12
@@ -1429,7 +1605,7 @@ async def set_daily_channel(
     ctx: discord.ApplicationContext,
     channel: discord.Option(discord.ForumChannel, description="The forum channel to post daily prompts in"),
 ):
-    _set_guild_channel(ctx.guild_id, str(channel.id))
+    await _set_guild_channel(ctx.guild_id, str(channel.id))
     await ctx.respond(
         f"✓ Daily challenge channel set to {channel.mention}.",
         ephemeral=True,
@@ -1450,7 +1626,7 @@ async def set_daily_role(
     ctx: discord.ApplicationContext,
     role: discord.Option(discord.Role, description="Role to ping when a daily prompt is posted"),
 ):
-    _set_guild_daily_role(ctx.guild_id, str(role.id))
+    await _set_guild_daily_role(ctx.guild_id, str(role.id))
     await ctx.respond(
         f"✓ Daily prompt will now ping {role.mention}.",
         ephemeral=True,
@@ -1471,7 +1647,7 @@ async def set_required_role(
     ctx: discord.ApplicationContext,
     role: discord.Option(discord.Role, description="Role required to use the bot. Admins always bypass this."),
 ):
-    _set_guild_required_role(ctx.guild_id, str(role.id))
+    await _set_guild_required_role(ctx.guild_id, str(role.id))
     await ctx.respond(
         f"✓ Bot access restricted to {role.mention} (and admins) in this server.",
         ephemeral=True,

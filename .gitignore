@@ -11,3 +11,9 @@ venv/
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Runtime state — per-guild config and the live schedule are written by the bot
+# and must not be committed (config.json contains guild/channel/role IDs).
+config.json
+daily_schedule.json
+*.tmp

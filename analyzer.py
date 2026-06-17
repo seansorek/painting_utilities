@@ -13,6 +13,28 @@ from PIL import Image, ImageEnhance
 from sklearn.cluster import KMeans
 
 # ---------------------------------------------------------------------------
+# Image safety policy (single source of truth)
+#
+# All untrusted images enter through load_image_from_bytes(), which is the one
+# place that enforces these limits. Every downstream function (compute_stats,
+# apply_gradient_map, KMeans sampling, rendering, ...) therefore only ever sees
+# an already-bounded image, so none of them can be used as a decompression-bomb
+# vector. Purpose-specific resizes elsewhere (KMeans 200x200 sample, colorblind
+# thumbnail, recolor output cap) are about quality/output size, not safety.
+# ---------------------------------------------------------------------------
+
+# Reject images that decode to more than this many pixels (a tiny compressed
+# file can otherwise expand to gigabytes of raster and OOM the host).
+MAX_IMAGE_PIXELS = 40_000_000  # ~40 MP
+
+# Also raise PIL's own guard so a malformed/oversized raster is refused even if
+# the declared dimensions slipped past the explicit check below.
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+# Longest edge every loaded image is downscaled to before any processing.
+MAX_WORKING_DIM = 2048
+
+# ---------------------------------------------------------------------------
 # Named color reference table (~140 entries for precise nearest-color naming)
 # ---------------------------------------------------------------------------
 _NAMED_COLORS = [
@@ -279,9 +301,35 @@ def adjust_image(
 # Image loading / extraction / stats
 # ---------------------------------------------------------------------------
 
-def load_image_from_bytes(data: bytes) -> Image.Image:
+def _downscale_to_working(img: Image.Image, max_dim: int = MAX_WORKING_DIM) -> Image.Image:
+    """Downscale so the longest edge is at most max_dim; leave smaller images as-is."""
+    longest = max(img.width, img.height)
+    if longest <= max_dim:
+        return img
+    ratio = max_dim / longest
+    return img.resize(
+        (max(1, round(img.width * ratio)), max(1, round(img.height * ratio))),
+        Image.LANCZOS,
+    )
+
+
+def load_image_from_bytes(data: bytes, max_dim: int = MAX_WORKING_DIM) -> Image.Image:
+    """Decode untrusted image bytes into a safe, size-bounded RGB image.
+
+    This is the single choke point for image safety: it rejects oversized images
+    (decompression-bomb guard) using the declared dimensions before the full
+    raster is materialised, then downscales to a bounded working resolution so
+    no downstream operation ever touches an unbounded array.
+    """
     img = Image.open(io.BytesIO(data))
-    return img.convert("RGB")
+    width, height = img.size
+    if width * height > MAX_IMAGE_PIXELS:
+        raise ValueError(
+            f"Image is too large to process: {width}×{height} px exceeds the "
+            f"{MAX_IMAGE_PIXELS:,}-pixel limit."
+        )
+    img = img.convert("RGB")
+    return _downscale_to_working(img, max_dim)
 
 
 def extract_dominant_colors(
