@@ -82,6 +82,44 @@ class TestColorLine:
         assert "CMYK(0%, 100%, 100%, 0%)" in line
 
 
+class _FakeAttachment:
+    def __init__(self, content_type="image/png", size=1000, width=100, height=100,
+                 filename="art.png"):
+        self.content_type = content_type
+        self.size = size
+        self.width = width
+        self.height = height
+        self.filename = filename
+
+
+class TestImageRejectionReason:
+    def test_valid_image_accepted(self):
+        assert bot._image_rejection_reason(_FakeAttachment()) is None
+
+    def test_non_image_rejected(self):
+        reason = bot._image_rejection_reason(_FakeAttachment(content_type="text/plain"))
+        assert reason and "not a valid image" in reason
+
+    def test_oversized_bytes_rejected(self):
+        reason = bot._image_rejection_reason(
+            _FakeAttachment(size=bot.MAX_FILE_BYTES + 1)
+        )
+        assert reason and "too large" in reason
+
+    def test_too_many_pixels_rejected(self):
+        big = bot.MAX_IMAGE_PIXELS  # width*height will exceed the cap
+        reason = bot._image_rejection_reason(
+            _FakeAttachment(width=big, height=2)
+        )
+        assert reason and "too many pixels" in reason
+
+    def test_missing_dimensions_does_not_crash(self):
+        # Discord may omit width/height; that must not raise.
+        assert bot._image_rejection_reason(
+            _FakeAttachment(width=None, height=None)
+        ) is None
+
+
 class TestCache:
     @pytest.fixture(autouse=True)
     def clear_cache(self):
