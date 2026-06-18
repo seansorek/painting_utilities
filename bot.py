@@ -9,7 +9,7 @@ import re
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import date as _date, datetime, timedelta
 
 import discord
 import pytz
@@ -1437,7 +1437,6 @@ def _parse_release_datetime(time_str: str, date_str: str | None = None) -> str:
     elif date_str == "tomorrow":
         base = (now_et + timedelta(days=1)).date()
     elif m2 := _DATE_YMD_RE.match(date_str):
-        from datetime import date as _date
         base = _date(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
     elif m2 := _DATE_MDY_RE.match(date_str):
         month, day_n = int(m2.group(1)), int(m2.group(2))
@@ -1445,13 +1444,13 @@ def _parse_release_datetime(time_str: str, date_str: str | None = None) -> str:
         year = int(year_raw) if year_raw else now_et.year
         if year < 100:
             year += 2000
-        from datetime import date as _date
         base = _date(year, month, day_n)
+        if not year_raw and base < now_et.date():
+            base = _date(year + 1, month, day_n)
     elif m2 := _DATE_MONTH_RE.match(date_str):
         month = _MONTH_NAMES[m2.group(1)[:3].lower()]
         day_n = int(m2.group(2))
         year = now_et.year
-        from datetime import date as _date
         candidate = _date(year, month, day_n)
         if candidate < now_et.date():
             candidate = _date(year + 1, month, day_n)
