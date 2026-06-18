@@ -5,6 +5,7 @@ Bug B: A failed post must keep the entry in the schedule; only a successful
        post should remove the entry.
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -37,6 +38,12 @@ def _make_discord_stub():
             def decorator(fn):
                 return fn
             return decorator
+
+        def check(self, fn):
+            return fn
+
+        def get_channel(self, channel_id):
+            return None
 
         def get_guild(self, guild_id):
             return self._guilds.get(guild_id)
@@ -74,8 +81,28 @@ def _make_discord_stub():
     class _ApplicationContext:
         pass
 
+    class _ForumChannel:
+        pass
+
+    class _Member:
+        pass
+
+    class _Role:
+        pass
+
+    class _Thread:
+        pass
+
+    class _Message:
+        pass
+
     def _Option(type_, **kwargs):
         return None
+
+    def _default_permissions(**kwargs):
+        def decorator(fn):
+            return fn
+        return decorator
 
     discord_mod.Bot = _Bot
     discord_mod.Intents = _Intents
@@ -84,14 +111,54 @@ def _make_discord_stub():
     discord_mod.File = _File
     discord_mod.Attachment = _Attachment
     discord_mod.ApplicationContext = _ApplicationContext
+    discord_mod.ForumChannel = _ForumChannel
+    discord_mod.Member = _Member
+    discord_mod.Role = _Role
+    discord_mod.Thread = _Thread
+    discord_mod.Message = _Message
     discord_mod.Option = _Option
+    discord_mod.default_permissions = _default_permissions
     return discord_mod
+
+
+def _make_ext_stub():
+    """Stub for discord.ext.commands and discord.ext.tasks."""
+    ext_mod = types.ModuleType("discord.ext")
+
+    commands_mod = types.ModuleType("discord.ext.commands")
+
+    class _CheckFailure(Exception):
+        pass
+
+    commands_mod.CheckFailure = _CheckFailure
+
+    tasks_mod = types.ModuleType("discord.ext.tasks")
+
+    class _LoopDecorator:
+        """Mimics @tasks.loop -- stores the coro and exposes start/is_running."""
+        def __init__(self, **kwargs):
+            pass
+
+        def __call__(self, fn):
+            async def wrapper(*args, **kwargs):
+                return await fn(*args, **kwargs)
+
+            wrapper.start = lambda: None
+            wrapper.is_running = lambda: False
+            return wrapper
+
+    tasks_mod.loop = _LoopDecorator
+
+    ext_mod.commands = commands_mod
+    ext_mod.tasks = tasks_mod
+    return ext_mod, commands_mod, tasks_mod
 
 
 def _make_analyzer_stub():
     """Return a minimal stub for the analyzer module."""
     mod = types.ModuleType("analyzer")
     for name in [
+        "MAX_IMAGE_PIXELS",
         "load_image_from_bytes", "extract_dominant_colors", "compute_stats",
         "render_palette_chart", "render_hue_saturation_chart", "render_chart_to_bytesio",
         "nearest_color_name", "apply_gradient_map", "GRADIENT_PRESETS", "parse_hex_color",
@@ -105,14 +172,22 @@ def _make_analyzer_stub():
     ]:
         setattr(mod, name, MagicMock())
     mod.GRADIENT_PRESETS = {}
+    mod.MAX_IMAGE_PIXELS = 100_000_000
     return mod
 
 
 # Install stubs before importing bot
-sys.modules.setdefault("discord", _make_discord_stub())
+_discord_stub = _make_discord_stub()
+_ext_stub, _commands_stub, _tasks_stub = _make_ext_stub()
+sys.modules.setdefault("discord", _discord_stub)
+sys.modules.setdefault("discord.ext", _ext_stub)
+sys.modules.setdefault("discord.ext.commands", _commands_stub)
+sys.modules.setdefault("discord.ext.tasks", _tasks_stub)
 sys.modules.setdefault("analyzer", _make_analyzer_stub())
 sys.modules.setdefault("dotenv", types.ModuleType("dotenv"))
 sys.modules["dotenv"].load_dotenv = lambda: None
+sys.modules.setdefault("pytz", types.ModuleType("pytz"))
+sys.modules["pytz"].timezone = lambda tz: timezone.utc  # simplify: treat ET as UTC for tests
 
 # Now import the module under test
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -241,6 +316,8 @@ class TestPostScheduledChallengesBugB(unittest.IsolatedAsyncioTestCase):
             await bot_module._post_scheduled_challenges()
             mock_send.assert_not_called()
 
+        # _save_schedule is always called; verify the entry is preserved
+        self.assertTrue(self.mock_save.called, "_save_schedule should be called")
         saved = self.mock_save.call_args[0][0]
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["content"], "later")
@@ -294,60 +371,47 @@ class TestPostScheduledChallengesExpiry(unittest.IsolatedAsyncioTestCase):
 class TestSendDailyChallenge(unittest.IsolatedAsyncioTestCase):
     """Unit tests for _send_daily_challenge return values."""
 
-    def _make_bot_with_guild(self, guild_id, channel_id, channel=None):
-        mock_guild = MagicMock()
-        mock_guild.get_channel.return_value = channel
-        bot_module.bot._guilds = {guild_id: mock_guild}
-        return mock_guild
-
-    async def asyncTearDown(self):
-        bot_module.bot._guilds = {}
-
-    async def test_returns_false_when_guild_not_found(self):
-        bot_module.bot._guilds = {}
-        result = await bot_module._send_daily_challenge(
-            {"guild_id": "999", "channel_id": "1", "content": "hi", "post_at": _past_iso()}
-        )
-        self.assertFalse(result)
-
-    async def test_returns_false_when_channel_not_found(self):
-        self._make_bot_with_guild(42, 99, channel=None)
-        result = await bot_module._send_daily_challenge(
-            {"guild_id": "42", "channel_id": "99", "content": "hi", "post_at": _past_iso()}
-        )
-        self.assertFalse(result)
-
-    async def test_returns_true_on_successful_send(self):
-        mock_channel = AsyncMock()
-        mock_channel.send = AsyncMock()
-        self._make_bot_with_guild(42, 99, channel=mock_channel)
-
-        result = await bot_module._send_daily_challenge(
-            {"guild_id": "42", "channel_id": "99", "content": "hello", "post_at": _past_iso()}
-        )
-        self.assertTrue(result)
-        mock_channel.send.assert_awaited_once_with("hello")
-
-    async def test_returns_false_on_discord_api_error(self):
-        mock_channel = AsyncMock()
-        mock_channel.send = AsyncMock(side_effect=Exception("Discord API error"))
-        self._make_bot_with_guild(42, 99, channel=mock_channel)
-
-        result = await bot_module._send_daily_challenge(
-            {"guild_id": "42", "channel_id": "99", "content": "hi", "post_at": _past_iso()}
-        )
-        self.assertFalse(result)
-
     async def test_returns_false_when_guild_id_missing(self):
         result = await bot_module._send_daily_challenge(
             {"channel_id": "99", "content": "hi", "post_at": _past_iso()}
         )
         self.assertFalse(result)
 
-    async def test_returns_false_when_channel_id_missing(self):
-        result = await bot_module._send_daily_challenge(
-            {"guild_id": "1", "content": "hi", "post_at": _past_iso()}
-        )
+    async def test_returns_false_when_no_channel_configured(self):
+        with patch.object(bot_module, "_get_guild_channel", return_value=None):
+            result = await bot_module._send_daily_challenge(
+                {"guild_id": "42", "content": "hi", "post_at": _past_iso()}
+            )
+        self.assertFalse(result)
+
+    async def test_returns_false_when_channel_not_found(self):
+        with patch.object(bot_module, "_get_guild_channel", return_value="99"), \
+             patch.object(bot_module.bot, "get_channel", return_value=None):
+            result = await bot_module._send_daily_challenge(
+                {"guild_id": "42", "content": "hi", "post_at": _past_iso()}
+            )
+        self.assertFalse(result)
+
+    async def test_returns_true_on_successful_send(self):
+        mock_channel = AsyncMock()
+        mock_channel.create_thread = AsyncMock()
+
+        with patch.object(bot_module, "_get_guild_channel", return_value="99"), \
+             patch.object(bot_module.bot, "get_channel", return_value=mock_channel):
+            result = await bot_module._send_daily_challenge(
+                {"guild_id": "42", "day": "Day 1", "content": "hello", "post_at": _past_iso()}
+            )
+        self.assertTrue(result)
+
+    async def test_returns_false_on_discord_api_error(self):
+        mock_channel = AsyncMock()
+        mock_channel.create_thread = AsyncMock(side_effect=Exception("Discord API error"))
+
+        with patch.object(bot_module, "_get_guild_channel", return_value="99"), \
+             patch.object(bot_module.bot, "get_channel", return_value=mock_channel):
+            result = await bot_module._send_daily_challenge(
+                {"guild_id": "42", "day": "Day 1", "content": "hi", "post_at": _past_iso()}
+            )
         self.assertFalse(result)
 
 
