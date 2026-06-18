@@ -974,7 +974,11 @@ if __name__ == "__main__":
     print(f"Brightness: {stats['brightness']}")
     print(f"Contrast:   {stats['contrast']}")
     print(f"Saturation: {stats['mean_saturation_pct']}%")
-    print(f"Dominant hue range: {stats['dominant_hue_range'][0]}-{stats['dominant_hue_range'][1]} deg")
+    hue_range = stats['dominant_hue_range']
+    if hue_range == (None, None):
+        print("Dominant hue range: no chromatic pixels")
+    else:
+        print(f"Dominant hue range: {hue_range[0]}-{hue_range[1]} deg")
     print("\nDominant colors:")
     total = counts.sum()
     for rgb, cnt in zip(colors, counts):

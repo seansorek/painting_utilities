@@ -253,6 +253,8 @@ def _pct_bar(pct: float, width: int = 8) -> str:
 
 
 def _hue_range_label(hue_range: tuple[int, int]) -> str:
+    if hue_range == (None, None):
+        return "N/A"
     hue_names = {
         (0, 30): "Red", (30, 60): "Orange", (60, 90): "Yellow",
         (90, 150): "Green", (150, 210): "Cyan", (210, 270): "Blue",
