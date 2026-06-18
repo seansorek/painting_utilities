@@ -8,6 +8,7 @@ import random
 import re
 import time
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date as _date, datetime, timedelta
 
@@ -1630,6 +1631,7 @@ async def daily_challenge(
             return
 
     challenge = {
+        "id":              str(uuid.uuid4()),
         "guild_id":        str(ctx.guild_id),
         "day":             day,
         "description":     description,
@@ -1657,6 +1659,208 @@ async def daily_challenge(
         f"✓ **{day}** scheduled for **{formatted_time}**.",
         ephemeral=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Schedule management helpers & commands
+# ---------------------------------------------------------------------------
+
+async def _challenge_autocomplete(ctx: discord.AutocompleteContext) -> list[discord.OptionChoice]:
+    guild_id = str(ctx.interaction.guild_id)
+    async with _SCHEDULE_LOCK:
+        schedule = _load_schedule()
+    guild_challenges = sorted(
+        [c for c in schedule if c.get("guild_id") == guild_id],
+        key=lambda c: c.get("post_at", ""),
+    )
+    choices = []
+    for c in guild_challenges:
+        try:
+            t = datetime.fromisoformat(c["post_at"]).astimezone(ET)
+            hour = t.hour % 12 or 12
+            ampm = "AM" if t.hour < 12 else "PM"
+            time_label = f"{t.month}/{t.day} {hour}:{t.minute:02d} {ampm}"
+        except (KeyError, ValueError):
+            time_label = "?"
+        label = f"{c['day']} — {time_label}"[:100]
+        value = c.get("id") or c.get("post_at", label)
+        choices.append(discord.OptionChoice(name=label, value=value))
+    typed = ctx.value.lower()
+    return [ch for ch in choices if typed in ch.name.lower()][:25]
+
+
+@bot.slash_command(
+    name="list_schedule",
+    description="List all pending daily art prompts scheduled for this server (admin only)",
+    guild_ids=guild_ids,
+)
+@discord.default_permissions(manage_guild=True)
+async def list_schedule(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+    guild_id = str(ctx.guild_id)
+    async with _SCHEDULE_LOCK:
+        schedule = _load_schedule()
+    guild_challenges = sorted(
+        [c for c in schedule if c.get("guild_id") == guild_id],
+        key=lambda c: c.get("post_at", ""),
+    )
+    if not guild_challenges:
+        await ctx.followup.send("No challenges scheduled for this server.", ephemeral=True)
+        return
+    lines = []
+    for i, c in enumerate(guild_challenges, 1):
+        try:
+            t = datetime.fromisoformat(c["post_at"]).astimezone(ET)
+            hour = t.hour % 12 or 12
+            ampm = "AM" if t.hour < 12 else "PM"
+            time_str = f"{t.strftime('%B')} {t.day} at {hour}:{t.minute:02d} {ampm} ET"
+        except (KeyError, ValueError):
+            time_str = "unknown time"
+        desc = c.get("description") or ""
+        snippet = desc[:80] + ("…" if len(desc) > 80 else "")
+        lines.append(f"**{i}.** **{c.get('day', '?')}** — posts {time_str}\n   _{snippet}_")
+    body = "\n\n".join(lines)
+    header = f"**Scheduled challenges ({len(guild_challenges)}):**\n\n"
+    max_body = 1900 - len(header)
+    if len(body) > max_body:
+        body = body[:max_body].rsplit("\n", 1)[0] + "\n\n…(truncated)"
+    await ctx.followup.send(header + body, ephemeral=True)
+
+
+@bot.slash_command(
+    name="delete_challenge",
+    description="Delete a pending daily art prompt from the schedule (admin only)",
+    guild_ids=guild_ids,
+)
+@discord.default_permissions(manage_guild=True)
+async def delete_challenge(
+    ctx: discord.ApplicationContext,
+    challenge: discord.Option(
+        str,
+        description="The challenge to delete",
+        autocomplete=_challenge_autocomplete,
+    ),
+):
+    await ctx.defer(ephemeral=True)
+    guild_id = str(ctx.guild_id)
+    async with _SCHEDULE_LOCK:
+        schedule = _load_schedule()
+        new_schedule = [
+            c for c in schedule
+            if not (
+                c.get("guild_id") == guild_id
+                and (c.get("id") == challenge or c.get("post_at") == challenge)
+            )
+        ]
+        if len(new_schedule) == len(schedule):
+            await ctx.followup.send(
+                "Challenge not found. It may have already been posted or deleted.",
+                ephemeral=True,
+            )
+            return
+        _save_schedule(new_schedule)
+    await ctx.followup.send("✓ Challenge deleted from the schedule.", ephemeral=True)
+
+
+@bot.slash_command(
+    name="edit_challenge",
+    description="Edit a pending daily art prompt in the schedule (admin only)",
+    guild_ids=guild_ids,
+)
+@discord.default_permissions(manage_guild=True)
+async def edit_challenge(
+    ctx: discord.ApplicationContext,
+    challenge: discord.Option(
+        str,
+        description="The challenge to edit",
+        autocomplete=_challenge_autocomplete,
+    ),
+    new_day: discord.Option(
+        str,
+        description='New label, e.g. "Day 43"',
+        required=False,
+        default=None,
+    ),
+    description: discord.Option(
+        str,
+        description="New prompt description",
+        required=False,
+        default=None,
+    ),
+    release_time: discord.Option(
+        str,
+        description='New post time (ET), e.g. "18:00", "6pm"',
+        required=False,
+        default=None,
+    ),
+    reference: discord.Option(
+        str,
+        description="New reference image URL",
+        required=False,
+        default=None,
+    ),
+    minimum_time: discord.Option(
+        str,
+        description='New minimum time, e.g. "10 minutes"',
+        required=False,
+        default=None,
+    ),
+    extra_challenge: discord.Option(
+        str,
+        description="New extra challenge text",
+        required=False,
+        default=None,
+    ),
+):
+    await ctx.defer(ephemeral=True)
+
+    if all(v is None for v in (new_day, description, release_time, reference, minimum_time, extra_challenge)):
+        await ctx.followup.send("No changes provided.", ephemeral=True)
+        return
+
+    if release_time is not None:
+        try:
+            new_post_at = _parse_release_time(release_time)
+        except ValueError:
+            await ctx.followup.send(
+                f"Could not parse release time `{release_time}`. "
+                "Use formats like `18:00`, `6pm`, or `6:30pm`.",
+                ephemeral=True,
+            )
+            return
+
+    guild_id = str(ctx.guild_id)
+    async with _SCHEDULE_LOCK:
+        schedule = _load_schedule()
+        target = next(
+            (
+                c for c in schedule
+                if c.get("guild_id") == guild_id
+                and (c.get("id") == challenge or c.get("post_at") == challenge)
+            ),
+            None,
+        )
+        if target is None:
+            await ctx.followup.send(
+                "Challenge not found. It may have already been posted or deleted.",
+                ephemeral=True,
+            )
+            return
+        if new_day is not None:
+            target["day"] = new_day
+        if description is not None:
+            target["description"] = description
+        if release_time is not None:
+            target["post_at"] = new_post_at
+        if reference is not None:
+            target["reference"] = reference
+        if minimum_time is not None:
+            target["minimum_time"] = minimum_time
+        if extra_challenge is not None:
+            target["extra_challenge"] = extra_challenge
+        _save_schedule(schedule)
+
+    await ctx.followup.send("✓ Challenge updated.", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
