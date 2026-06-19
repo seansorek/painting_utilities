@@ -199,8 +199,10 @@ async def _require_bot_role(ctx: discord.ApplicationContext) -> bool:
 async def _cooldown_check(ctx: discord.ApplicationContext) -> bool:
     """Per-user rate limit on the expensive image commands.
 
-    Runs after _require_bot_role (registered first), so cooldown is only spent
-    by users who are actually allowed to run the command.
+    Runs after _require_bot_role (registered first), so cooldown is only
+    checked (not consumed) here.  The timestamp is stamped by
+    ``_consume_cooldown`` *after* input validation succeeds, so a rejected
+    upload (wrong file type, too large, etc.) does not lock the user out.
     """
     if ctx.command is None or ctx.command.name not in _HEAVY_COMMANDS:
         return True
@@ -209,8 +211,16 @@ async def _cooldown_check(ctx: discord.ApplicationContext) -> bool:
     remaining = _COOLDOWN_SECONDS - (now - last)
     if remaining > 0:
         raise _CooldownError(remaining)
-    _USER_COOLDOWNS[ctx.author.id] = now
     return True
+
+
+def _consume_cooldown(user_id: int) -> None:
+    """Stamp the cooldown so the user must wait before the next heavy command.
+
+    Call this right after input validation succeeds — never before, so that
+    rejected requests do not waste the user's cooldown window.
+    """
+    _USER_COOLDOWNS[user_id] = time.monotonic()
 
 
 @bot.event
@@ -392,6 +402,7 @@ async def analyze(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -458,6 +469,7 @@ async def palette(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -517,6 +529,7 @@ async def gradient_map_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
 
     # Resolve gradient stops
     gradient_stops = None
@@ -595,6 +608,7 @@ async def palette_gradient_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -656,6 +670,7 @@ async def export_palette_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -722,6 +737,7 @@ async def export_gradient_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -782,6 +798,7 @@ async def color_info_cmd(
     except ValueError as e:
         await ctx.followup.send(str(e))
         return
+    _consume_cooldown(ctx.author.id)
 
     try:
         hex_str = f"#{r:02X}{g:02X}{b:02X}"
@@ -860,6 +877,7 @@ async def compare_cmd(
         if reason:
             await ctx.followup.send(reason)
             return
+    _consume_cooldown(ctx.author.id)
 
     try:
         data_a = await image_a.read()
@@ -921,6 +939,7 @@ async def colorblind_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -986,6 +1005,7 @@ async def recolor_cmd(
         if reason:
             await ctx.followup.send(reason)
             return
+    _consume_cooldown(ctx.author.id)
 
     try:
         src_data = await source.read()
@@ -1044,6 +1064,7 @@ async def suggest_harmony_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
