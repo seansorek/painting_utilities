@@ -89,6 +89,11 @@ _CONFIG_FILE     = os.path.join(os.path.dirname(__file__), "config.json")
 
 MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 
+# How many hours past post_at a scheduled challenge is kept for retry before
+# being dropped.  Prevents stale entries from accumulating if the bot is down
+# for an extended period or a guild channel is permanently misconfigured.
+_CHALLENGE_EXPIRY_HOURS = 24
+
 # message_content is intentionally NOT enabled: it is a privileged intent (needs
 # Discord approval + verification at 100 servers) and nothing here reads message
 # text — on_message only inspects attachments, which arrive without the intent.
@@ -199,8 +204,10 @@ async def _require_bot_role(ctx: discord.ApplicationContext) -> bool:
 async def _cooldown_check(ctx: discord.ApplicationContext) -> bool:
     """Per-user rate limit on the expensive image commands.
 
-    Runs after _require_bot_role (registered first), so cooldown is only spent
-    by users who are actually allowed to run the command.
+    Runs after _require_bot_role (registered first), so cooldown is only
+    checked (not consumed) here.  The timestamp is stamped by
+    ``_consume_cooldown`` *after* input validation succeeds, so a rejected
+    upload (wrong file type, too large, etc.) does not lock the user out.
     """
     if ctx.command is None or ctx.command.name not in _HEAVY_COMMANDS:
         return True
@@ -209,8 +216,16 @@ async def _cooldown_check(ctx: discord.ApplicationContext) -> bool:
     remaining = _COOLDOWN_SECONDS - (now - last)
     if remaining > 0:
         raise _CooldownError(remaining)
-    _USER_COOLDOWNS[ctx.author.id] = now
     return True
+
+
+def _consume_cooldown(user_id: int) -> None:
+    """Stamp the cooldown so the user must wait before the next heavy command.
+
+    Call this right after input validation succeeds — never before, so that
+    rejected requests do not waste the user's cooldown window.
+    """
+    _USER_COOLDOWNS[user_id] = time.monotonic()
 
 
 @bot.event
@@ -254,6 +269,8 @@ def _pct_bar(pct: float, width: int = 8) -> str:
 
 
 def _hue_range_label(hue_range: tuple[int, int]) -> str:
+    if hue_range == (None, None):
+        return "N/A"
     hue_names = {
         (0, 30): "Red", (30, 60): "Orange", (60, 90): "Yellow",
         (90, 150): "Green", (150, 210): "Cyan", (210, 270): "Blue",
@@ -392,6 +409,7 @@ async def analyze(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -458,6 +476,7 @@ async def palette(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -517,6 +536,7 @@ async def gradient_map_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
 
     # Resolve gradient stops
     gradient_stops = None
@@ -595,6 +615,7 @@ async def palette_gradient_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -656,6 +677,7 @@ async def export_palette_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -722,6 +744,7 @@ async def export_gradient_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -782,6 +805,7 @@ async def color_info_cmd(
     except ValueError as e:
         await ctx.followup.send(str(e))
         return
+    _consume_cooldown(ctx.author.id)
 
     try:
         hex_str = f"#{r:02X}{g:02X}{b:02X}"
@@ -860,6 +884,7 @@ async def compare_cmd(
         if reason:
             await ctx.followup.send(reason)
             return
+    _consume_cooldown(ctx.author.id)
 
     try:
         data_a = await image_a.read()
@@ -921,6 +946,7 @@ async def colorblind_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -986,6 +1012,7 @@ async def recolor_cmd(
         if reason:
             await ctx.followup.send(reason)
             return
+    _consume_cooldown(ctx.author.id)
 
     try:
         src_data = await source.read()
@@ -1044,6 +1071,7 @@ async def suggest_harmony_cmd(
     await ctx.defer()
     if not await _validate_image(ctx, image):
         return
+    _consume_cooldown(ctx.author.id)
     try:
         data = await image.read()
 
@@ -1494,18 +1522,20 @@ def _format_daily_post(challenge: dict) -> str:
     return "\n".join(lines)
 
 
-async def _send_daily_challenge(challenge: dict) -> None:
+async def _send_daily_challenge(challenge: dict) -> bool:
+    """Post a single scheduled challenge. Returns True on success, False on failure."""
     guild_id = challenge.get("guild_id")
-    channel_id = challenge.get("channel_id") or (
-        _get_guild_channel(int(guild_id)) if guild_id else None
-    )
+    if not guild_id:
+        print("Daily challenge: missing guild_id, skipping.")
+        return False
+    channel_id = challenge.get("channel_id") or _get_guild_channel(int(guild_id))
     if not channel_id:
         print(f"Daily challenge: no channel configured for guild {guild_id}, skipping.")
-        return
+        return False
     channel = bot.get_channel(int(channel_id))
     if channel is None:
         print(f"Daily challenge: channel {channel_id} not found for guild {guild_id}.")
-        return
+        return False
     content = _format_daily_post(challenge)
     day = challenge.get("day", "")
     thread_name = f"[ DAILY GESTURE ] — {day}" if day else "[ DAILY GESTURE ]"
@@ -1514,8 +1544,10 @@ async def _send_daily_challenge(challenge: dict) -> None:
             await channel.create_thread(name=thread_name, content=content)
         else:
             await channel.send(content=content)
+        return True
     except Exception:
         traceback.print_exc()
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1524,24 +1556,54 @@ async def _send_daily_challenge(challenge: dict) -> None:
 
 @tasks.loop(minutes=1)
 async def _post_scheduled_challenges() -> None:
+    """Tick function: deliver any challenges whose post_at time has arrived.
+
+    - Malformed/missing post_at entries are logged and dropped.
+    - Failed deliveries are kept in the schedule for retry.
+    - Entries more than _CHALLENGE_EXPIRY_HOURS past their post_at are dropped
+      so permanently-undeliverable entries do not accumulate indefinitely.
+
+    The lock is held during disk I/O but released for network sends so a
+    concurrent /daily_challenge can append without waiting on Discord API.
+    """
     now = datetime.now(ET)
-    # Decide what's due and persist the remainder under the lock, then do the
-    # (slow, network-bound) sends outside it — so a concurrent /daily_challenge
-    # can't have its append clobbered by this loop's save.
+
+    # --- Phase 1: classify entries under the lock ---
     async with _SCHEDULE_LOCK:
         schedule = _load_schedule()
-        due, remaining = [], []
+        due: list[tuple[dict, datetime]] = []
+        remaining: list[dict] = []
+
         for challenge in schedule:
             try:
                 post_at = datetime.fromisoformat(challenge["post_at"])
-            except (KeyError, ValueError):
-                traceback.print_exc()  # drop malformed entry
+            except (KeyError, ValueError, TypeError):
+                print(f"Daily challenge: bad post_at, dropping entry: {challenge!r}")
                 continue
-            (due if now >= post_at else remaining).append(challenge)
-        if len(remaining) != len(schedule):
-            _save_schedule(remaining)
-    for challenge in due:
-        await _send_daily_challenge(challenge)
+
+            if now >= post_at:
+                due.append((challenge, post_at))
+            else:
+                remaining.append(challenge)
+
+    # --- Phase 2: send due entries outside the lock (network-bound) ---
+    failed_keep: list[dict] = []
+    for challenge, post_at in due:
+        age = now - post_at
+        if age > timedelta(hours=_CHALLENGE_EXPIRY_HOURS):
+            print(
+                f"Daily challenge: expired (>{_CHALLENGE_EXPIRY_HOURS}h overdue), "
+                f"dropping: {challenge!r}"
+            )
+            continue
+
+        ok = await _send_daily_challenge(challenge)
+        if not ok:
+            failed_keep.append(challenge)
+
+    # --- Phase 3: persist under the lock ---
+    async with _SCHEDULE_LOCK:
+        _save_schedule(remaining + failed_keep)
 
 
 # ---------------------------------------------------------------------------
