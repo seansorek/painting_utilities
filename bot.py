@@ -89,6 +89,11 @@ _CONFIG_FILE     = os.path.join(os.path.dirname(__file__), "config.json")
 
 MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 
+# How many hours past post_at a scheduled challenge is kept for retry before
+# being dropped.  Prevents stale entries from accumulating if the bot is down
+# for an extended period or a guild channel is permanently misconfigured.
+_CHALLENGE_EXPIRY_HOURS = 24
+
 # message_content is intentionally NOT enabled: it is a privileged intent (needs
 # Discord approval + verification at 100 servers) and nothing here reads message
 # text — on_message only inspects attachments, which arrive without the intent.
@@ -1473,27 +1478,30 @@ def _format_daily_post(challenge: dict) -> str:
     return "\n".join(lines)
 
 
-async def _send_daily_challenge(challenge: dict) -> None:
+async def _send_daily_challenge(challenge: dict) -> bool:
+    """Post a single scheduled challenge. Returns True on success, False on failure."""
     guild_id = challenge.get("guild_id")
     if not guild_id:
         print("Daily challenge: missing guild_id, skipping.")
-        return
+        return False
     channel_id = _get_guild_channel(int(guild_id))
     if not channel_id:
         print(f"Daily challenge: no channel configured for guild {guild_id}, skipping.")
-        return
+        return False
     channel = bot.get_channel(int(channel_id))
     if channel is None:
         print(f"Daily challenge: channel {channel_id} not found for guild {guild_id}.")
-        return
+        return False
     content = _format_daily_post(challenge)
     try:
         await channel.create_thread(
             name=f"Daily Art Prompt — {challenge['day']}",
             content=content,
         )
+        return True
     except Exception:
         traceback.print_exc()
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1502,24 +1510,54 @@ async def _send_daily_challenge(challenge: dict) -> None:
 
 @tasks.loop(minutes=1)
 async def _post_scheduled_challenges() -> None:
+    """Tick function: deliver any challenges whose post_at time has arrived.
+
+    - Malformed/missing post_at entries are logged and dropped.
+    - Failed deliveries are kept in the schedule for retry.
+    - Entries more than _CHALLENGE_EXPIRY_HOURS past their post_at are dropped
+      so permanently-undeliverable entries do not accumulate indefinitely.
+
+    The lock is held during disk I/O but released for network sends so a
+    concurrent /daily_challenge can append without waiting on Discord API.
+    """
     now = datetime.now(ET)
-    # Decide what's due and persist the remainder under the lock, then do the
-    # (slow, network-bound) sends outside it — so a concurrent /daily_challenge
-    # can't have its append clobbered by this loop's save.
+
+    # --- Phase 1: classify entries under the lock ---
     async with _SCHEDULE_LOCK:
         schedule = _load_schedule()
-        due, remaining = [], []
+        due: list[tuple[dict, datetime]] = []
+        remaining: list[dict] = []
+
         for challenge in schedule:
             try:
                 post_at = datetime.fromisoformat(challenge["post_at"])
-            except (KeyError, ValueError):
-                traceback.print_exc()  # drop malformed entry
+            except (KeyError, ValueError, TypeError):
+                print(f"Daily challenge: bad post_at, dropping entry: {challenge!r}")
                 continue
-            (due if now >= post_at else remaining).append(challenge)
-        if len(remaining) != len(schedule):
-            _save_schedule(remaining)
-    for challenge in due:
-        await _send_daily_challenge(challenge)
+
+            if now >= post_at:
+                due.append((challenge, post_at))
+            else:
+                remaining.append(challenge)
+
+    # --- Phase 2: send due entries outside the lock (network-bound) ---
+    failed_keep: list[dict] = []
+    for challenge, post_at in due:
+        age = now - post_at
+        if age > timedelta(hours=_CHALLENGE_EXPIRY_HOURS):
+            print(
+                f"Daily challenge: expired (>{_CHALLENGE_EXPIRY_HOURS}h overdue), "
+                f"dropping: {challenge!r}"
+            )
+            continue
+
+        ok = await _send_daily_challenge(challenge)
+        if not ok:
+            failed_keep.append(challenge)
+
+    # --- Phase 3: persist under the lock ---
+    async with _SCHEDULE_LOCK:
+        _save_schedule(remaining + failed_keep)
 
 
 # ---------------------------------------------------------------------------
