@@ -10,7 +10,7 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import date as _date, datetime, timedelta
 
 import discord
 import pytz
@@ -1419,9 +1419,28 @@ _TIME_RE = re.compile(
     re.IGNORECASE,
 )
 
+_DATE_YMD_RE   = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_DATE_MDY_RE   = re.compile(r"^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$")
+_DATE_MONTH_RE = re.compile(
+    r"^(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    r"\s+(\d{1,2})$",
+    re.IGNORECASE,
+)
+_MONTH_NAMES = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
-def _parse_release_time(time_str: str) -> str:
-    """Return an ISO-8601 datetime string in ET for the given time (today or tomorrow)."""
+
+def _parse_release_datetime(time_str: str, date_str: str | None = None) -> str:
+    """Return an ISO-8601 datetime string in ET.
+
+    time_str: time of day, e.g. "18:00", "6pm", "6:30pm"
+    date_str: optional date; if None, uses today or tomorrow when time has passed.
+              Supported: "today", "tomorrow", "YYYY-MM-DD", "MM/DD", "MM/DD/YYYY",
+              "Month D", "Month DD" (e.g. "June 20").
+    """
     m = _TIME_RE.match(time_str.strip())
     if not m:
         raise ValueError(f"Cannot parse time: {time_str!r}")
@@ -1432,10 +1451,43 @@ def _parse_release_time(time_str: str) -> str:
         h += 12
     elif ampm == "am" and h == 12:
         h = 0
+
     now_et = datetime.now(ET)
-    target = now_et.replace(hour=h, minute=mins, second=0, microsecond=0)
-    if target <= now_et:
-        target += timedelta(days=1)
+
+    if date_str is None:
+        target = now_et.replace(hour=h, minute=mins, second=0, microsecond=0)
+        if target <= now_et:
+            target += timedelta(days=1)
+        return target.isoformat()
+
+    date_str = date_str.strip().lower()
+    if date_str == "today":
+        base = now_et.date()
+    elif date_str == "tomorrow":
+        base = (now_et + timedelta(days=1)).date()
+    elif m2 := _DATE_YMD_RE.match(date_str):
+        base = _date(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+    elif m2 := _DATE_MDY_RE.match(date_str):
+        month, day_n = int(m2.group(1)), int(m2.group(2))
+        year_raw = m2.group(3)
+        year = int(year_raw) if year_raw else now_et.year
+        if year < 100:
+            year += 2000
+        base = _date(year, month, day_n)
+        if not year_raw and base < now_et.date():
+            base = _date(year + 1, month, day_n)
+    elif m2 := _DATE_MONTH_RE.match(date_str):
+        month = _MONTH_NAMES[m2.group(1)[:3].lower()]
+        day_n = int(m2.group(2))
+        year = now_et.year
+        candidate = _date(year, month, day_n)
+        if candidate < now_et.date():
+            candidate = _date(year + 1, month, day_n)
+        base = candidate
+    else:
+        raise ValueError(f"Cannot parse date: {date_str!r}")
+
+    target = ET.localize(datetime(base.year, base.month, base.day, h, mins, 0))
     return target.isoformat()
 
 
@@ -1445,34 +1497,26 @@ def _random_minimum_time() -> str:
 
 
 def _format_daily_post(challenge: dict) -> str:
-    day         = challenge["day"]
-    description = challenge.get("description", "")
-    reference   = challenge.get("reference")
-    min_time    = challenge.get("minimum_time", "")
-    extra       = challenge.get("extra_challenge")
-    guild_id    = challenge.get("guild_id")
+    reference = challenge.get("reference")
+    min_time  = challenge.get("minimum_time", "")
+    extra     = challenge.get("extra_challenge")
+    guild_id  = challenge.get("guild_id")
 
     daily_role_id = _get_guild_daily_role(int(guild_id)) if guild_id else None
-    role_line = f"<@&{daily_role_id}>" if daily_role_id else ""
 
-    lines = [
-        "**DAILY ART PROMPT**",
-        "",
-        day,
-    ]
-    if role_line:
-        lines.append(role_line)
-    if description:
-        lines.append(description)
+    lines = ["DAILY GESTURE"]
+    if daily_role_id:
+        lines.append(f"<@&{daily_role_id}>")
+
     lines += ["", "□  □  □"]
 
     if reference:
-        lines += ["", "**REFERENCE**", f"> {reference}"]
+        lines += ["", "REFERENCE", reference]
 
-    lines += ["", "**MINIMUM TIME**", f"> {min_time}"]
+    lines += ["", "MINIMUM TIME", min_time]
 
     if extra:
-        lines += ["", "**EXTRA CHALLENGE**", f"> {extra}"]
+        lines += ["", "EXTRA CHALLENGE", extra]
 
     lines += ["", "□  □  □"]
     return "\n".join(lines)
@@ -1484,7 +1528,7 @@ async def _send_daily_challenge(challenge: dict) -> bool:
     if not guild_id:
         print("Daily challenge: missing guild_id, skipping.")
         return False
-    channel_id = _get_guild_channel(int(guild_id))
+    channel_id = challenge.get("channel_id") or _get_guild_channel(int(guild_id))
     if not channel_id:
         print(f"Daily challenge: no channel configured for guild {guild_id}, skipping.")
         return False
@@ -1493,11 +1537,13 @@ async def _send_daily_challenge(challenge: dict) -> bool:
         print(f"Daily challenge: channel {channel_id} not found for guild {guild_id}.")
         return False
     content = _format_daily_post(challenge)
+    day = challenge.get("day", "")
+    thread_name = f"[ DAILY GESTURE ] — {day}" if day else "[ DAILY GESTURE ]"
     try:
-        await channel.create_thread(
-            name=f"Daily Art Prompt — {challenge['day']}",
-            content=content,
-        )
+        if isinstance(channel, discord.ForumChannel):
+            await channel.create_thread(name=thread_name, content=content)
+        else:
+            await channel.send(content=content)
         return True
     except Exception:
         traceback.print_exc()
@@ -1566,19 +1612,24 @@ async def _post_scheduled_challenges() -> None:
 
 @bot.slash_command(
     name="daily_challenge",
-    description="Schedule a daily art prompt thread in the configured forum channel",
+    description="Schedule a daily gesture thread in the configured forum channel",
     guild_ids=guild_ids,
 )
 @discord.default_permissions(manage_guild=True)
 async def daily_challenge(
     ctx: discord.ApplicationContext,
-    day: discord.Option(str, description='Label shown in the post header, e.g. "Day 42" or "Saturday"'),
-    description: discord.Option(str, description="The art prompt / challenge description"),
+    day: discord.Option(str, description='Label used in the thread title, e.g. "Day 42" or "Saturday"'),
     release_time: discord.Option(
         str,
-        description='When to post (ET), e.g. "18:00", "6pm", "6:30pm". Defaults to 6pm.',
+        description='Time to post (ET), e.g. "18:00", "6pm", "6:30pm". Defaults to 6pm.',
         required=False,
         default="18:00",
+    ),
+    release_date: discord.Option(
+        str,
+        description='Date to post (ET), e.g. "2026-06-20", "June 20", "tomorrow". Defaults to today/tomorrow.',
+        required=False,
+        default=None,
     ),
     reference: discord.Option(
         str,
@@ -1598,15 +1649,27 @@ async def daily_challenge(
         required=False,
         default=None,
     ),
+    description: discord.Option(
+        str,
+        description="Optional notes (stored but not shown in the post).",
+        required=False,
+        default=None,
+    ),
+    channel_id: discord.Option(
+        str,
+        description="Channel ID to post in. Overrides the server default (useful for test channels).",
+        required=False,
+        default=None,
+    ),
 ):
     await ctx.defer(ephemeral=True)
 
     try:
-        post_at_iso = _parse_release_time(release_time)
-    except ValueError as exc:
+        post_at_iso = _parse_release_datetime(release_time, release_date)
+    except ValueError:
         await ctx.followup.send(
-            f"Could not parse release time `{release_time}`. "
-            "Use formats like `18:00`, `6pm`, or `6:30pm`.",
+            f"Could not parse date/time `{release_date} {release_time}`. "
+            "Time: `18:00`, `6pm`, `6:30pm`. Date: `2026-06-20`, `June 20`, `tomorrow`.",
             ephemeral=True,
         )
         return
@@ -1619,25 +1682,28 @@ async def daily_challenge(
         if refs:
             reference = random.choice(refs)
 
-    channel_id = _get_guild_channel(ctx.guild_id)
     if not channel_id:
-        await ctx.followup.send(
-            "No forum channel configured for this server. "
-            "An admin must run `/set_daily_channel` first.",
-            ephemeral=True,
-        )
-        return
+        default_channel_id = _get_guild_channel(ctx.guild_id)
+        if not default_channel_id:
+            await ctx.followup.send(
+                "No forum channel configured for this server. "
+                "An admin must run `/set_daily_channel` first, or provide a `channel_id`.",
+                ephemeral=True,
+            )
+            return
 
     challenge = {
-        "id":             str(uuid.uuid4()),
-        "guild_id":       str(ctx.guild_id),
-        "day":            day,
-        "description":    description,
-        "post_at":        post_at_iso,
-        "reference":      reference,
-        "minimum_time":   minimum_time,
+        "id":              str(uuid.uuid4()),
+        "guild_id":        str(ctx.guild_id),
+        "day":             day,
+        "description":     description,
+        "post_at":         post_at_iso,
+        "reference":       reference,
+        "minimum_time":    minimum_time,
         "extra_challenge": extra_challenge,
     }
+    if channel_id:
+        challenge["channel_id"] = channel_id
 
     async with _SCHEDULE_LOCK:
         schedule = _load_schedule()
@@ -1647,9 +1713,12 @@ async def daily_challenge(
     post_at_dt = datetime.fromisoformat(post_at_iso)
     hour = post_at_dt.hour % 12 or 12
     ampm = "AM" if post_at_dt.hour < 12 else "PM"
-    formatted_time = f"{hour}:{post_at_dt.minute:02d} {ampm} ET, {post_at_dt.strftime('%B')} {post_at_dt.day}"
+    formatted_time = (
+        f"{hour}:{post_at_dt.minute:02d} {ampm} ET, "
+        f"{post_at_dt.strftime('%B')} {post_at_dt.day}, {post_at_dt.year}"
+    )
     await ctx.followup.send(
-        f"✓ Daily challenge scheduled for **{formatted_time}**.",
+        f"✓ **{day}** scheduled for **{formatted_time}**.",
         ephemeral=True,
     )
 
