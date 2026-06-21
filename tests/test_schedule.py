@@ -404,7 +404,7 @@ class TestSendDailyChallenge(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
 
     async def test_returns_false_on_discord_api_error(self):
-        mock_channel = AsyncMock()
+        mock_channel = AsyncMock(spec=_discord_stub.ForumChannel)
         mock_channel.create_thread = AsyncMock(side_effect=Exception("Discord API error"))
 
         with patch.object(bot_module, "_get_guild_channel", return_value="99"), \
