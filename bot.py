@@ -131,6 +131,8 @@ async def _run_cpu(func, *args, **kwargs):
         _CPU_EXECUTOR, functools.partial(func, *args, **kwargs)
     )
 
+_run_sync = _run_cpu
+
 
 class _CooldownError(commands.CheckFailure):
     """Raised when a user invokes a heavy command before their cooldown expires."""
