@@ -1882,7 +1882,7 @@ async def edit_challenge(
 
     if release_time is not None:
         try:
-            new_post_at = _parse_release_time(release_time)
+            new_post_at = _parse_release_datetime(release_time)
         except ValueError:
             await ctx.followup.send(
                 f"Could not parse release time `{release_time}`. "
