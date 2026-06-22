@@ -118,6 +118,16 @@ def _make_discord_stub():
     discord_mod.Message = _Message
     discord_mod.Option = _Option
     discord_mod.default_permissions = _default_permissions
+
+    class _AutocompleteContext:
+        pass
+
+    class _OptionChoice:
+        def __init__(self, **kwargs):
+            pass
+
+    discord_mod.AutocompleteContext = _AutocompleteContext
+    discord_mod.OptionChoice = _OptionChoice
     return discord_mod
 
 
@@ -404,7 +414,7 @@ class TestSendDailyChallenge(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
 
     async def test_returns_false_on_discord_api_error(self):
-        mock_channel = AsyncMock()
+        mock_channel = AsyncMock(spec=_discord_stub.ForumChannel)
         mock_channel.create_thread = AsyncMock(side_effect=Exception("Discord API error"))
 
         with patch.object(bot_module, "_get_guild_channel", return_value="99"), \
