@@ -1539,11 +1539,17 @@ async def _send_daily_challenge(challenge: dict) -> bool:
     content = _format_daily_post(challenge)
     day = challenge.get("day", "")
     thread_name = f"[ DAILY GESTURE ] — {day}" if day else "[ DAILY GESTURE ]"
+    daily_role_id = _get_guild_daily_role(int(guild_id))
+    allowed = discord.AllowedMentions(
+        everyone=False,
+        users=False,
+        roles=[discord.Object(int(daily_role_id))] if daily_role_id else False,
+    )
     try:
         if isinstance(channel, discord.ForumChannel):
-            await channel.create_thread(name=thread_name, content=content)
+            await channel.create_thread(name=thread_name, content=content, allowed_mentions=allowed)
         else:
-            await channel.send(content=content)
+            await channel.send(content=content, allowed_mentions=allowed)
         return True
     except Exception:
         traceback.print_exc()
@@ -1960,6 +1966,12 @@ async def set_daily_role(
     ctx: discord.ApplicationContext,
     role: discord.Option(discord.Role, description="Role to ping when a daily prompt is posted"),
 ):
+    if role.id == ctx.guild_id:
+        await ctx.respond(
+            "Can't use @everyone as the daily-ping role. Pick a non-default role.",
+            ephemeral=True,
+        )
+        return
     await _set_guild_daily_role(ctx.guild_id, str(role.id))
     await ctx.respond(
         f"✓ Daily prompt will now ping {role.mention}.",
