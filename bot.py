@@ -1496,6 +1496,9 @@ def _random_minimum_time() -> str:
     return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
 
+DISCORD_CONTENT_LIMIT = 2000
+
+
 def _format_daily_post(challenge: dict) -> str:
     reference = challenge.get("reference")
     min_time  = challenge.get("minimum_time", "")
@@ -1704,6 +1707,16 @@ async def daily_challenge(
     }
     if channel_id:
         challenge["channel_id"] = channel_id
+
+    rendered_len = len(_format_daily_post(challenge))
+    if rendered_len > DISCORD_CONTENT_LIMIT:
+        await ctx.followup.send(
+            f"Combined post is {rendered_len} characters, exceeding Discord's "
+            f"{DISCORD_CONTENT_LIMIT}-char limit. Shorten the reference, "
+            f"extra_challenge, or other fields and try again.",
+            ephemeral=True,
+        )
+        return
 
     async with _SCHEDULE_LOCK:
         schedule = _load_schedule()
