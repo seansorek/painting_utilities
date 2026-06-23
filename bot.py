@@ -1939,6 +1939,17 @@ async def edit_challenge(
             target["minimum_time"] = minimum_time
         if extra_challenge is not None:
             target["extra_challenge"] = extra_challenge
+
+        rendered_len = len(_format_daily_post(target))
+        if rendered_len > DISCORD_CONTENT_LIMIT:
+            await ctx.followup.send(
+                f"Combined post is {rendered_len} characters, exceeding Discord's "
+                f"{DISCORD_CONTENT_LIMIT}-char limit. Shorten the reference, "
+                f"extra_challenge, or other fields and try again.",
+                ephemeral=True,
+            )
+            return
+
         _save_schedule(schedule)
 
     await ctx.followup.send("✓ Challenge updated.", ephemeral=True)
