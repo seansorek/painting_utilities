@@ -579,7 +579,7 @@ def simulate_colorblindness(img: Image.Image, cb_type: str) -> Image.Image:
 def render_colorblind_comparison(img: Image.Image) -> io.BytesIO:
     """4-panel grid: original + deuteranopia + protanopia + tritanopia."""
     max_dim = 380
-    ratio = min(max_dim / img.width, max_dim / img.height)
+    ratio = min(1.0, max_dim / img.width, max_dim / img.height)
     thumb_w = max(1, int(img.width * ratio))
     thumb_h = max(1, int(img.height * ratio))
     thumb = img.resize((thumb_w, thumb_h), Image.LANCZOS)
