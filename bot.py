@@ -1596,7 +1596,18 @@ async def _post_scheduled_challenges() -> None:
                 remaining.append(challenge)
 
     # --- Phase 2: send due entries outside the lock (network-bound) ---
-    failed_keep: list[dict] = []
+    # Collect the IDs of all entries seen in Phase 1 so we can distinguish
+    # newly-added entries (by /daily_challenge) from stale ones in Phase 3.
+    phase1_ids: set[str] = set()
+    for c in schedule:
+        cid = c.get("id")
+        if cid:
+            phase1_ids.add(cid)
+
+    # IDs of challenges that failed delivery and should be retried.
+    # For entries without an ID, collect them in failed_noID for fallback.
+    failed_ids: set[str] = set()
+    failed_noID: list[dict] = []
     for challenge, post_at in due:
         age = now - post_at
         if age > timedelta(hours=_CHALLENGE_EXPIRY_HOURS):
@@ -1608,11 +1619,34 @@ async def _post_scheduled_challenges() -> None:
 
         ok = await _send_daily_challenge(challenge)
         if not ok:
-            failed_keep.append(challenge)
+            cid = challenge.get("id")
+            if cid:
+                failed_ids.add(cid)
+            else:
+                failed_noID.append(challenge)
 
     # --- Phase 3: persist under the lock ---
+    # Re-read the schedule from disk so that any entries added concurrently
+    # (e.g. by /daily_challenge) are preserved.  We only remove entries whose
+    # IDs we know were processed in Phase 1; entries not seen in Phase 1
+    # (i.e. concurrently added) are kept unconditionally.
     async with _SCHEDULE_LOCK:
-        _save_schedule(remaining + failed_keep)
+        fresh_schedule = _load_schedule()
+        merged = []
+        for c in fresh_schedule:
+            cid = c.get("id")
+            if cid is None:
+                # Legacy entry without an ID: fall back to Phase 1 classification.
+                if c in remaining or c in failed_noID:
+                    merged.append(c)
+            elif cid not in phase1_ids:
+                # Entry added concurrently after Phase 1 -- keep it.
+                merged.append(c)
+            elif cid in failed_ids:
+                # Delivery failed -- keep for retry.
+                merged.append(c)
+            # else: successfully sent or expired -- drop it.
+        _save_schedule(merged)
 
 
 # ---------------------------------------------------------------------------
