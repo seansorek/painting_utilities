@@ -415,5 +415,90 @@ class TestSendDailyChallenge(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result)
 
 
+class TestPostScheduledChallengesTOCTOU(unittest.IsolatedAsyncioTestCase):
+    """Issue #46: concurrent additions during Phase 2 must not be lost.
+
+    The race is: Phase 1 reads the schedule, Phase 2 releases the lock for
+    network sends (during which /daily_challenge may append a new entry), and
+    Phase 3 must preserve that new entry rather than overwriting with the
+    Phase 1 snapshot.
+    """
+
+    async def asyncSetUp(self):
+        self._load_patch = patch.object(bot_module, "_load_schedule")
+        self._save_patch = patch.object(bot_module, "_save_schedule")
+        self.mock_load = self._load_patch.start()
+        self.mock_save = self._save_patch.start()
+
+    async def asyncTearDown(self):
+        self._load_patch.stop()
+        self._save_patch.stop()
+
+    async def test_concurrent_addition_preserved(self):
+        """An entry added during Phase 2 (network sends) is kept in Phase 3."""
+        existing_entry = {
+            "id": "existing-1",
+            "guild_id": "1",
+            "channel_id": "10",
+            "content": "due now",
+            "post_at": _past_iso(1),
+        }
+        concurrent_entry = {
+            "id": "concurrent-new",
+            "guild_id": "2",
+            "channel_id": "20",
+            "content": "added while sending",
+            "post_at": _future_iso(2),
+        }
+
+        # Phase 1 sees only the existing entry.
+        # Phase 3 re-reads and sees both (simulating concurrent addition).
+        self.mock_load.side_effect = [
+            [existing_entry],            # Phase 1 read
+            [existing_entry, concurrent_entry],  # Phase 3 re-read
+        ]
+
+        with patch.object(bot_module, "_send_daily_challenge", new=AsyncMock(return_value=True)):
+            await bot_module._post_scheduled_challenges()
+
+        saved = self.mock_save.call_args[0][0]
+        # The existing entry was sent successfully -> removed.
+        # The concurrent entry was NOT in Phase 1 -> preserved.
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["id"], "concurrent-new")
+        self.assertEqual(saved[0]["content"], "added while sending")
+
+    async def test_concurrent_addition_preserved_alongside_failed(self):
+        """Both a failed retry entry and a concurrent addition survive Phase 3."""
+        due_entry = {
+            "id": "due-1",
+            "guild_id": "1",
+            "channel_id": "10",
+            "content": "will fail",
+            "post_at": _past_iso(1),
+        }
+        concurrent_entry = {
+            "id": "concurrent-2",
+            "guild_id": "3",
+            "channel_id": "30",
+            "content": "new",
+            "post_at": _future_iso(3),
+        }
+
+        self.mock_load.side_effect = [
+            [due_entry],
+            [due_entry, concurrent_entry],
+        ]
+
+        with patch.object(bot_module, "_send_daily_challenge", new=AsyncMock(return_value=False)):
+            await bot_module._post_scheduled_challenges()
+
+        saved = self.mock_save.call_args[0][0]
+        saved_ids = {c["id"] for c in saved}
+        # Both the failed entry (retry) and the concurrent entry are kept.
+        self.assertIn("due-1", saved_ids)
+        self.assertIn("concurrent-2", saved_ids)
+
+
 if __name__ == "__main__":
     unittest.main()
