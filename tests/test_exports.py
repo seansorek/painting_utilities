@@ -189,7 +189,6 @@ class TestSanitizeExportName:
         assert _sanitize_export_name("My Palette", css=True) == "my-palette"
 
     def test_css_mode_strips_special_chars(self):
-        # Braces, semicolons, colons -- all stripped in CSS mode.
         assert _sanitize_export_name("a}; x:y{z", css=True) == "a-xyz"
 
     def test_css_mode_strips_newlines(self):
@@ -208,16 +207,12 @@ class TestExportCssSanitisation:
     def test_injection_stripped(self):
         malicious = "x}; body{background:red"
         text = export_css(COLORS, name=malicious).decode("utf-8")
-        # Braces, semicolons, colons are stripped -- no CSS rule injection.
-        assert "}" not in text.replace(":root {", "").replace("}", "", 1) or text.count("}") == 1
         assert text.startswith(":root {")
-        # Only one rule block should exist (the :root block).
         assert text.count("{") == 1
         assert text.count("}") == 1
 
     def test_special_chars_removed(self):
         text = export_css(COLORS, name="a;b:c{d}e").decode("utf-8")
-        # No semicolons or braces from the name should leak into property names.
         for line in text.splitlines():
             if line.startswith("  --"):
                 prop_name = line.split(":")[0].strip().lstrip("-")
@@ -232,9 +227,7 @@ class TestExportGplSanitisation:
     def test_newline_in_name_stripped(self):
         text = export_gpl(COLORS, name="Pal\nColumns: 99").decode("utf-8")
         lines = text.splitlines()
-        # The Name line should not be split.
         assert lines[1] == "Name: PalColumns: 99"
-        # "Columns: 0" should only appear once (the real one).
         assert sum(1 for l in lines if l.startswith("Columns:")) == 1
 
 
@@ -245,7 +238,6 @@ class TestExportGgrSanitisation:
         text = export_gradient_ggr(STOPS, name="grad\nEvil: header").decode("utf-8")
         lines = text.splitlines()
         assert lines[1] == "Name: gradEvil: header"
-        # Total lines should be 3 + segments, not more.
         assert len(lines) == 3 + (len(STOPS) - 1)
 
 
