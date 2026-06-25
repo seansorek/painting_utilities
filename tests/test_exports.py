@@ -5,6 +5,7 @@ import struct
 import pytest
 
 from analyzer import (
+    _sanitize_export_name,
     export_ase,
     export_swatches,
     export_gpl,
@@ -168,3 +169,91 @@ def test_palette_exporters_return_bytes(fn):
 @pytest.mark.parametrize("fn", [export_gradient_ggr, export_gradient_json])
 def test_gradient_exporters_return_bytes(fn):
     assert isinstance(fn(STOPS), bytes)
+
+
+# ---------------------------------------------------------------------------
+# Sanitisation tests (issue #48)
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeExportName:
+    """Unit tests for _sanitize_export_name."""
+
+    def test_strips_newlines(self):
+        assert _sanitize_export_name("hello\nworld") == "helloworld"
+
+    def test_strips_carriage_returns(self):
+        assert _sanitize_export_name("hello\r\nworld") == "helloworld"
+
+    def test_css_mode_lowercases_and_slugifies(self):
+        assert _sanitize_export_name("My Palette", css=True) == "my-palette"
+
+    def test_css_mode_strips_special_chars(self):
+        # Braces, semicolons, colons -- all stripped in CSS mode.
+        assert _sanitize_export_name("a}; x:y{z", css=True) == "a-xyz"
+
+    def test_css_mode_strips_newlines(self):
+        assert _sanitize_export_name("a\nb", css=True) == "ab"
+
+    def test_plain_mode_preserves_spaces(self):
+        assert _sanitize_export_name("My Palette") == "My Palette"
+
+    def test_empty_string(self):
+        assert _sanitize_export_name("", css=True) == ""
+
+
+class TestExportCssSanitisation:
+    """CSS injection is blocked by _sanitize_export_name(css=True)."""
+
+    def test_injection_stripped(self):
+        malicious = "x}; body{background:red"
+        text = export_css(COLORS, name=malicious).decode("utf-8")
+        # Braces, semicolons, colons are stripped -- no CSS rule injection.
+        assert "}" not in text.replace(":root {", "").replace("}", "", 1) or text.count("}") == 1
+        assert text.startswith(":root {")
+        # Only one rule block should exist (the :root block).
+        assert text.count("{") == 1
+        assert text.count("}") == 1
+
+    def test_special_chars_removed(self):
+        text = export_css(COLORS, name="a;b:c{d}e").decode("utf-8")
+        # No semicolons or braces from the name should leak into property names.
+        for line in text.splitlines():
+            if line.startswith("  --"):
+                prop_name = line.split(":")[0].strip().lstrip("-")
+                assert ";" not in prop_name
+                assert "{" not in prop_name
+                assert "}" not in prop_name
+
+
+class TestExportGplSanitisation:
+    """Newline injection in GPL Name header is blocked."""
+
+    def test_newline_in_name_stripped(self):
+        text = export_gpl(COLORS, name="Pal\nColumns: 99").decode("utf-8")
+        lines = text.splitlines()
+        # The Name line should not be split.
+        assert lines[1] == "Name: PalColumns: 99"
+        # "Columns: 0" should only appear once (the real one).
+        assert sum(1 for l in lines if l.startswith("Columns:")) == 1
+
+
+class TestExportGgrSanitisation:
+    """Newline injection in GGR Name header is blocked."""
+
+    def test_newline_in_name_stripped(self):
+        text = export_gradient_ggr(STOPS, name="grad\nEvil: header").decode("utf-8")
+        lines = text.splitlines()
+        assert lines[1] == "Name: gradEvil: header"
+        # Total lines should be 3 + segments, not more.
+        assert len(lines) == 3 + (len(STOPS) - 1)
+
+
+class TestExportTailwindSanitisation:
+    """Tailwind keys are sanitised via CSS mode."""
+
+    def test_special_chars_stripped(self):
+        data = json.loads(export_tailwind(COLORS, name="a;b"))
+        colors = data["theme"]["extend"]["colors"]
+        for key in colors:
+            assert ";" not in key

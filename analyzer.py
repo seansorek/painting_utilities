@@ -1,6 +1,7 @@
 import io
 import json
 import math
+import re
 import struct
 import colorsys
 
@@ -843,6 +844,22 @@ def render_chart_to_bytesio(fig: plt.Figure) -> io.BytesIO:
 # Export functions
 # ---------------------------------------------------------------------------
 
+
+def _sanitize_export_name(name: str, *, css: bool = False) -> str:
+    """Sanitize a user-supplied export name.
+
+    * Always strips newlines and carriage returns so header-injection in
+      line-oriented formats (GPL, GGR) is impossible.
+    * When *css* is True the result is further restricted to ``[a-z0-9-]``
+      so it is safe for use in CSS custom-property names.
+    """
+    # Strip control characters that could inject extra header lines.
+    name = name.replace("\n", "").replace("\r", "")
+    if css:
+        name = re.sub(r"[^a-z0-9-]", "", name.lower().replace(" ", "-"))
+    return name
+
+
 def export_ase(colors: list[tuple[int, int, int]], name: str = "Palette") -> bytes:
     blocks = []
     for i, (r, g, b) in enumerate(colors):
@@ -871,6 +888,7 @@ def export_swatches(colors: list[tuple[int, int, int]], name: str = "Palette") -
 
 def export_gpl(colors: list[tuple[int, int, int]], name: str = "Palette") -> bytes:
     """GIMP Palette (.gpl) format."""
+    name = _sanitize_export_name(name)
     lines = ["GIMP Palette", f"Name: {name}", "Columns: 0", "#"]
     for r, g, b in colors:
         color_name = nearest_color_name((r, g, b))
@@ -901,7 +919,7 @@ def export_aco(colors: list[tuple[int, int, int]], name: str = "Palette") -> byt
 
 def export_css(colors: list[tuple[int, int, int]], name: str = "palette") -> bytes:
     """CSS custom properties (.css)."""
-    prefix = name.lower().replace(" ", "-")
+    prefix = _sanitize_export_name(name, css=True)
     lines = [":root {"]
     for i, (r, g, b) in enumerate(colors):
         hex_val = f"#{r:02X}{g:02X}{b:02X}"
@@ -913,7 +931,7 @@ def export_css(colors: list[tuple[int, int, int]], name: str = "palette") -> byt
 
 def export_tailwind(colors: list[tuple[int, int, int]], name: str = "palette") -> bytes:
     """Tailwind config color extension (.json)."""
-    prefix = name.lower().replace(" ", "-")
+    prefix = _sanitize_export_name(name, css=True)
     color_dict = {
         f"{prefix}-{i + 1}": f"#{r:02X}{g:02X}{b:02X}"
         for i, (r, g, b) in enumerate(colors)
@@ -926,6 +944,7 @@ def export_gradient_ggr(
     gradient_stops: list[tuple[float, int, int, int]],
     name: str = "palette_gradient",
 ) -> bytes:
+    name = _sanitize_export_name(name)
     stops = sorted(gradient_stops, key=lambda s: s[0])
     n_segments = len(stops) - 1
     lines = ["GIMP Gradient", f"Name: {name}", str(n_segments)]
@@ -945,6 +964,7 @@ def export_gradient_json(
     gradient_stops: list[tuple[float, int, int, int]],
     name: str = "palette_gradient",
 ) -> bytes:
+    name = _sanitize_export_name(name)
     stops_list = [
         {"position": round(pos, 6), "r": r, "g": g, "b": b}
         for pos, r, g, b in sorted(gradient_stops, key=lambda s: s[0])
