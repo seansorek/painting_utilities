@@ -1,4 +1,5 @@
 import io
+import re
 import json
 import math
 import re
@@ -848,13 +849,12 @@ def render_chart_to_bytesio(fig: plt.Figure) -> io.BytesIO:
 def _sanitize_export_name(name: str, *, css: bool = False) -> str:
     """Sanitize a user-supplied export name.
 
-    * Always strips newlines and carriage returns so header-injection in
-      line-oriented formats (GPL, GGR) is impossible.
-    * When *css* is True the result is further restricted to ``[a-z0-9-]``
-      so it is safe for use in CSS custom-property names.
+    Strips all control characters so header-injection in line-oriented
+    formats (GPL, GGR) is impossible.
+    When *css* is True the result is further restricted to ``[a-z0-9-]``
+    so it is safe for use in CSS custom-property names.
     """
-    # Strip control characters that could inject extra header lines.
-    name = name.replace("\n", "").replace("\r", "")
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name)
     if css:
         name = re.sub(r"[^a-z0-9-]", "", name.lower().replace(" ", "-"))
     return name
