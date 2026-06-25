@@ -1457,9 +1457,11 @@ def _parse_release_datetime(time_str: str, date_str: str | None = None) -> str:
     now_et = datetime.now(ET)
 
     if date_str is None:
-        target = now_et.replace(hour=h, minute=mins, second=0, microsecond=0)
+        naive = datetime.now(ET).replace(tzinfo=None).replace(hour=h, minute=mins, second=0, microsecond=0)
+        target = ET.localize(naive)
+        now_et = datetime.now(ET)
         if target <= now_et:
-            target += timedelta(days=1)
+            target = ET.normalize(target + timedelta(days=1))
         return target.isoformat()
 
     date_str = date_str.strip().lower()
