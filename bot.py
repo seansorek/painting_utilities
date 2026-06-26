@@ -685,21 +685,21 @@ async def export_palette_cmd(
 
         def _work():
             img = load_image_from_bytes(data)
-            return extract_dominant_colors(img, n=num_colors)
+            colors, counts = extract_dominant_colors(img, n=num_colors)
+            color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
+            format_map = {
+                "ase":      (export_ase,      "palette.ase"),
+                "swatches": (export_swatches, "palette.swatches"),
+                "gpl":      (export_gpl,      f"{palette_name}.gpl"),
+                "aco":      (export_aco,      "palette.aco"),
+                "css":      (export_css,      "palette.css"),
+                "tailwind": (export_tailwind, "palette.json"),
+            }
+            fn, filename = format_map[format]
+            file_bytes = fn(color_list, palette_name)
+            return colors, counts, color_list, file_bytes, filename
 
-        colors, counts = await _run_cpu(_work)
-        color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
-
-        format_map = {
-            "ase":      (export_ase,      "palette.ase"),
-            "swatches": (export_swatches, "palette.swatches"),
-            "gpl":      (export_gpl,      f"{palette_name}.gpl"),
-            "aco":      (export_aco,      "palette.aco"),
-            "css":      (export_css,      "palette.css"),
-            "tailwind": (export_tailwind, "palette.json"),
-        }
-        fn, filename = format_map[format]
-        file_bytes = fn(color_list, palette_name)
+        colors, counts, color_list, file_bytes, filename = await _run_cpu(_work)
 
         total = counts.sum()
         lines = [
@@ -757,16 +757,15 @@ async def export_gradient_cmd(
             if reverse:
                 gradient_stops = reverse_gradient(gradient_stops)
             swatch_buf = render_gradient_preview(gradient_stops)
-            return colors, gradient_stops, swatch_buf
+            if format == "ggr":
+                file_bytes = export_gradient_ggr(gradient_stops, name=gradient_name)
+                filename = f"{gradient_name}.ggr"
+            else:
+                file_bytes = export_gradient_json(gradient_stops, name=gradient_name)
+                filename = f"{gradient_name}.json"
+            return colors, gradient_stops, swatch_buf, file_bytes, filename
 
-        colors, gradient_stops, swatch_buf = await _run_cpu(_work)
-
-        if format == "ggr":
-            file_bytes = export_gradient_ggr(gradient_stops, name=gradient_name)
-            filename = f"{gradient_name}.ggr"
-        else:
-            file_bytes = export_gradient_json(gradient_stops, name=gradient_name)
-            filename = f"{gradient_name}.json"
+        colors, gradient_stops, swatch_buf, file_bytes, filename = await _run_cpu(_work)
         stop_colors = " → ".join(f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in sorted(gradient_stops))
         embed = discord.Embed(
             title=f"Gradient Export — {image.filename}",
