@@ -1937,7 +1937,7 @@ async def edit_challenge(
 
     if release_time is not None:
         try:
-            new_post_at = _parse_release_datetime(release_time)
+            _parse_release_datetime(release_time)  # validate only; date computed below
         except ValueError:
             await ctx.followup.send(
                 f"Could not parse release time `{release_time}`. "
@@ -1968,7 +1968,10 @@ async def edit_challenge(
         if description is not None:
             target["description"] = description
         if release_time is not None:
-            target["post_at"] = new_post_at
+            existing_dt = datetime.fromisoformat(target["post_at"]).astimezone(ET)
+            target["post_at"] = _parse_release_datetime(
+                release_time, existing_dt.strftime("%Y-%m-%d")
+            )
         if reference is not None:
             target["reference"] = reference
         if minimum_time is not None:
