@@ -1363,7 +1363,7 @@ def _config() -> dict:
 
 async def _persist_config() -> None:
     async with _CONFIG_LOCK:
-        _atomic_write_json(_CONFIG_FILE, _config())
+        await asyncio.to_thread(_atomic_write_json, _CONFIG_FILE, _config())
 
 
 def _load_references() -> list[str]:
@@ -1581,7 +1581,7 @@ async def _post_scheduled_challenges() -> None:
 
     # --- Phase 1: classify entries under the lock ---
     async with _SCHEDULE_LOCK:
-        schedule = _load_schedule()
+        schedule = await asyncio.to_thread(_load_schedule)
         due: list[tuple[dict, datetime]] = []
         remaining: list[dict] = []
 
@@ -1633,7 +1633,7 @@ async def _post_scheduled_challenges() -> None:
     # IDs we know were processed in Phase 1; entries not seen in Phase 1
     # (i.e. concurrently added) are kept unconditionally.
     async with _SCHEDULE_LOCK:
-        fresh_schedule = _load_schedule()
+        fresh_schedule = await asyncio.to_thread(_load_schedule)
         merged = []
         for c in fresh_schedule:
             cid = c.get("id")
@@ -1648,7 +1648,7 @@ async def _post_scheduled_challenges() -> None:
                 # Delivery failed -- keep for retry.
                 merged.append(c)
             # else: successfully sent or expired -- drop it.
-        _save_schedule(merged)
+        await asyncio.to_thread(_save_schedule, merged)
 
 
 # ---------------------------------------------------------------------------
@@ -1723,7 +1723,7 @@ async def daily_challenge(
         minimum_time = _random_minimum_time()
 
     if reference is None:
-        refs = _load_references()
+        refs = await asyncio.to_thread(_load_references)
         if refs:
             reference = random.choice(refs)
 
@@ -1761,9 +1761,9 @@ async def daily_challenge(
         return
 
     async with _SCHEDULE_LOCK:
-        schedule = _load_schedule()
+        schedule = await asyncio.to_thread(_load_schedule)
         schedule.append(challenge)
-        _save_schedule(schedule)
+        await asyncio.to_thread(_save_schedule, schedule)
 
     post_at_dt = datetime.fromisoformat(post_at_iso)
     hour = post_at_dt.hour % 12 or 12
@@ -1785,7 +1785,7 @@ async def daily_challenge(
 async def _challenge_autocomplete(ctx: discord.AutocompleteContext) -> list[discord.OptionChoice]:
     guild_id = str(ctx.interaction.guild_id)
     async with _SCHEDULE_LOCK:
-        schedule = _load_schedule()
+        schedule = await asyncio.to_thread(_load_schedule)
     guild_challenges = sorted(
         [c for c in schedule if c.get("guild_id") == guild_id],
         key=lambda c: c.get("post_at", ""),
@@ -1816,7 +1816,7 @@ async def list_schedule(ctx: discord.ApplicationContext):
     await ctx.defer(ephemeral=True)
     guild_id = str(ctx.guild_id)
     async with _SCHEDULE_LOCK:
-        schedule = _load_schedule()
+        schedule = await asyncio.to_thread(_load_schedule)
     guild_challenges = sorted(
         [c for c in schedule if c.get("guild_id") == guild_id],
         key=lambda c: c.get("post_at", ""),
@@ -1861,7 +1861,7 @@ async def delete_challenge(
     await ctx.defer(ephemeral=True)
     guild_id = str(ctx.guild_id)
     async with _SCHEDULE_LOCK:
-        schedule = _load_schedule()
+        schedule = await asyncio.to_thread(_load_schedule)
         new_schedule = [
             c for c in schedule
             if not (
@@ -1875,7 +1875,7 @@ async def delete_challenge(
                 ephemeral=True,
             )
             return
-        _save_schedule(new_schedule)
+        await asyncio.to_thread(_save_schedule, new_schedule)
     await ctx.followup.send("✓ Challenge deleted from the schedule.", ephemeral=True)
 
 
@@ -1948,7 +1948,7 @@ async def edit_challenge(
 
     guild_id = str(ctx.guild_id)
     async with _SCHEDULE_LOCK:
-        schedule = _load_schedule()
+        schedule = await asyncio.to_thread(_load_schedule)
         target = next(
             (
                 c for c in schedule
@@ -1989,7 +1989,7 @@ async def edit_challenge(
             )
             return
 
-        _save_schedule(schedule)
+        await asyncio.to_thread(_save_schedule, schedule)
 
     await ctx.followup.send("✓ Challenge updated.", ephemeral=True)
 
