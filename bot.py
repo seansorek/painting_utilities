@@ -663,6 +663,20 @@ async def palette_gradient_cmd(
 # /export_palette
 # ---------------------------------------------------------------------------
 
+def _sanitize_filename_component(name: str) -> str:
+    """Sanitize a user-supplied string for safe use as a filename component.
+
+    Strips control characters (including \\r, \\n) and replaces path
+    separators and other filesystem-unsafe characters with underscores,
+    so a malicious ``palette_name`` can't inject newlines or traverse
+    directories via the attachment filename.
+    """
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name)
+    name = re.sub(r"[\\/:*?\"<>|]", "_", name)
+    name = name.strip().strip(".")
+    return name or "Palette"
+
+
 @bot.slash_command(name="export_palette",
                    description="Export dominant colors as a palette file for design software",
                    guild_ids=guild_ids)
@@ -687,10 +701,11 @@ async def export_palette_cmd(
             img = load_image_from_bytes(data)
             colors, counts = extract_dominant_colors(img, n=num_colors)
             color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
+            safe_palette_name = _sanitize_filename_component(palette_name)
             format_map = {
                 "ase":      (export_ase,      "palette.ase"),
                 "swatches": (export_swatches, "palette.swatches"),
-                "gpl":      (export_gpl,      f"{palette_name}.gpl"),
+                "gpl":      (export_gpl,      f"{safe_palette_name}.gpl"),
                 "aco":      (export_aco,      "palette.aco"),
                 "css":      (export_css,      "palette.css"),
                 "tailwind": (export_tailwind, "palette.json"),

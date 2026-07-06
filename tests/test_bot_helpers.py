@@ -256,3 +256,48 @@ class TestScheduleAndReferencesOffThread:
 
         mock_loop.is_running.assert_called_once()
         mock_loop.start.assert_called_once()
+
+
+class TestSanitizeFilenameComponent:
+    """`_sanitize_filename_component` guards the .gpl attachment filename
+    built from the user-supplied `palette_name` (issue #32): control
+    characters and path separators must not survive into the filename.
+    """
+
+    def test_strips_newlines_and_carriage_returns(self):
+        result = bot._sanitize_filename_component("foo\nColumns: 99\n255 0 0 evil")
+        assert "\n" not in result
+        assert result == "fooColumns_ 99255 0 0 evil"
+
+        assert bot._sanitize_filename_component("foo\r\nbar") == "foobar"
+
+    def test_replaces_path_separators(self):
+        result = bot._sanitize_filename_component("../../etc/passwd")
+        assert "/" not in result
+        assert result == "_.._etc_passwd"
+
+        result2 = bot._sanitize_filename_component("C:\\Windows\\System32")
+        assert "\\" not in result2
+        assert ":" not in result2
+        assert result2 == "C__Windows_System32"
+
+    def test_replaces_other_filesystem_unsafe_chars(self):
+        result = bot._sanitize_filename_component('a*b?c"d<e>f|g')
+        for ch in '*?"<>|':
+            assert ch not in result
+        assert result == "a_b_c_d_e_f_g"
+
+    def test_full_filename_has_no_injected_or_unsafe_chars(self):
+        malicious = "foo\nColumns: 99\n255 0 0 evil/../secret"
+        safe = bot._sanitize_filename_component(malicious)
+        filename = f"{safe}.gpl"
+        for ch in "\n\r/\\":
+            assert ch not in filename
+
+    def test_normal_name_unchanged(self):
+        assert bot._sanitize_filename_component("My Palette") == "My Palette"
+
+    def test_empty_or_dots_only_falls_back_to_default(self):
+        assert bot._sanitize_filename_component("") == "Palette"
+        assert bot._sanitize_filename_component("...") == "Palette"
+        assert bot._sanitize_filename_component("\n\r") == "Palette"
