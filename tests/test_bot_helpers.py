@@ -192,6 +192,35 @@ class TestOnReadyGuard:
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
 
+
+class TestScheduleAndReferencesOffThread:
+    """_load_schedule/_save_schedule/_load_references do blocking file I/O and
+    must be safe to call via asyncio.to_thread from async handlers (#49)."""
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_save_then_load_schedule_round_trips_via_to_thread(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(bot, "_SCHEDULE_FILE", str(tmp_path / "daily_schedule.json"))
+        challenges = [{"id": "abc", "day": "Day 1", "post_at": "2026-01-01T00:00:00+00:00"}]
+
+        self._run(asyncio.to_thread(bot._save_schedule, challenges))
+        loaded = self._run(asyncio.to_thread(bot._load_schedule))
+
+        assert loaded == challenges
+
+    def test_load_schedule_missing_file_returns_empty_list_via_to_thread(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(bot, "_SCHEDULE_FILE", str(tmp_path / "does_not_exist.json"))
+
+        assert self._run(asyncio.to_thread(bot._load_schedule)) == []
+
+    def test_load_references_via_to_thread(self, tmp_path, monkeypatch):
+        refs_path = tmp_path / "references.json"
+        refs_path.write_text('["http://example.com/a.png"]', encoding="utf-8")
+        monkeypatch.setattr(bot, "_REFERENCES_FILE", str(refs_path))
+
+        assert self._run(asyncio.to_thread(bot._load_references)) == ["http://example.com/a.png"]
+
     def _patch_bot_user(self):
         """Return a context manager that makes bot.bot.user a non-None mock.
 
