@@ -274,3 +274,32 @@ Allow a role to use the bot in this server. Until this is run, only administrato
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `role` | required | The role allowed to use the bot |
+
+---
+
+### `/list_schedule`
+List all pending daily art prompts scheduled for this server (admin only). Output is ephemeral (only visible to you).
+
+---
+
+### `/delete_challenge`
+Delete a pending daily art prompt from the schedule before it posts.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `challenge` | required | The scheduled challenge to delete (autocomplete from pending queue) |
+
+---
+
+### `/edit_challenge`
+Edit a pending daily art prompt in the schedule. Only the fields you provide are updated; omitted fields keep their current values.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `challenge` | required | The scheduled challenge to edit (autocomplete from pending queue) |
+| `new_day` | — | New label, e.g. `Day 43` |
+| `description` | — | New prompt description |
+| `release_time` | — | New post time (ET), e.g. `18:00`, `6pm` |
+| `reference` | — | New reference image URL |
+| `minimum_time` | — | New minimum time, e.g. `10 minutes` |
+| `extra_challenge` | — | New extra challenge text |
