@@ -226,8 +226,19 @@ def _consume_cooldown(user_id: int) -> None:
 
     Call this right after input validation succeeds — never before, so that
     rejected requests do not waste the user's cooldown window.
+
+    Opportunistically prunes any entries that have already expired, so
+    _USER_COOLDOWNS never accumulates a permanent entry per user (mirrors the
+    bounded-size eviction used by _IMAGE_CACHE above).
     """
-    _USER_COOLDOWNS[user_id] = time.monotonic()
+    now = time.monotonic()
+    expired = [
+        uid for uid, ts in _USER_COOLDOWNS.items()
+        if now - ts >= _COOLDOWN_SECONDS
+    ]
+    for uid in expired:
+        _USER_COOLDOWNS.pop(uid, None)
+    _USER_COOLDOWNS[user_id] = now
 
 
 @bot.event

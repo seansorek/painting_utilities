@@ -134,6 +134,41 @@ class TestCooldownConsumedOnSuccess:
         result = _run(bot._cooldown_check(ctx))
         assert result is True
 
+    def test_consume_cooldown_prunes_expired_entries(self):
+        """_consume_cooldown must opportunistically evict stale entries.
+
+        Regression test for #33: _USER_COOLDOWNS previously grew unbounded
+        because entries were only ever written, never removed. A stale entry
+        (older than _COOLDOWN_SECONDS) must be dropped the next time any
+        user's cooldown is consumed.
+        """
+        stale_user_id = 100
+        active_user_id = 101
+
+        # A stale entry that expired well in the past.
+        bot._USER_COOLDOWNS[stale_user_id] = (
+            time.monotonic() - bot._COOLDOWN_SECONDS - 5
+        )
+        assert stale_user_id in bot._USER_COOLDOWNS
+
+        # Consuming a cooldown for a different user should prune the stale one.
+        bot._consume_cooldown(active_user_id)
+
+        assert stale_user_id not in bot._USER_COOLDOWNS
+        assert active_user_id in bot._USER_COOLDOWNS
+
+    def test_consume_cooldown_keeps_unexpired_entries(self):
+        """Entries still within the cooldown window must survive pruning."""
+        recent_user_id = 102
+        active_user_id = 103
+
+        bot._USER_COOLDOWNS[recent_user_id] = time.monotonic()
+
+        bot._consume_cooldown(active_user_id)
+
+        assert recent_user_id in bot._USER_COOLDOWNS
+        assert active_user_id in bot._USER_COOLDOWNS
+
 
 class TestCooldownCheckDoesNotStamp:
     """The _cooldown_check function must NOT stamp the cooldown itself."""
