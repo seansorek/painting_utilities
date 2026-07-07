@@ -273,7 +273,13 @@ async def on_message(message: discord.Message) -> None:
         a.content_type and a.content_type.startswith("image/")
         for a in message.attachments
     ):
-        await message.add_reaction("⭐")
+        try:
+            await message.add_reaction("⭐")
+        except discord.HTTPException as e:
+            # Missing Add Reactions / Read Message History perms, the message
+            # was deleted before we could react, or a transient API error.
+            # None of these are actionable here, so just log and move on.
+            print(f"on_message: failed to add star reaction: {e}")
 
 
 def _pct_bar(pct: float, width: int = 8) -> str:
