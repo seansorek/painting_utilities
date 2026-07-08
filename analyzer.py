@@ -343,6 +343,8 @@ def extract_dominant_colors(
     km.fit(pixels)
     centers = km.cluster_centers_.astype(int)
     counts = np.bincount(km.labels_, minlength=n)
+    mask = counts > 0
+    centers, counts = centers[mask], counts[mask]
     order = np.argsort(counts)[::-1]
     return centers[order], counts[order]
 
