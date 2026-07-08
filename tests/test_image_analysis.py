@@ -90,6 +90,26 @@ class TestExtractDominantColors:
         assert np.array_equal(a[0], b[0])
         assert np.array_equal(a[1], b[1])
 
+    def test_solid_image_drops_empty_clusters(self):
+        # A solid-color image has only 1 distinct color, so requesting many
+        # more clusters than that forces KMeans to produce empty clusters.
+        # Those should be excluded from the returned palette entirely.
+        img = make_solid_image((180, 60, 90))
+        colors, counts = extract_dominant_colors(img, n=8)
+        assert colors.shape == (1, 3)
+        assert counts.shape == (1,)
+        assert counts[0] == 200 * 200
+        assert np.allclose(colors[0], [180, 60, 90], atol=3)
+
+    def test_no_zero_count_entries_when_colors_fewer_than_n(self):
+        img = make_multicolor_image([(200, 0, 0), (0, 200, 0)])
+        colors, counts = extract_dominant_colors(img, n=8)
+        # Only as many clusters as actually have assigned pixels should
+        # be returned; none should have a zero count.
+        assert all(c > 0 for c in counts)
+        assert colors.shape[0] == counts.shape[0]
+        assert colors.shape[0] <= 8
+
 
 class TestComputeStats:
     def test_keys_present(self):
