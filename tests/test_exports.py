@@ -91,6 +91,39 @@ class TestExportAco:
     def test_returns_bytes(self):
         assert isinstance(export_aco(COLORS), bytes)
 
+    def test_v2_name_length_is_utf16_code_units_for_non_bmp_name(self):
+        # "🎨" is a non-BMP character: 1 code point, but 2 UTF-16 code units
+        # (a surrogate pair). The declared name length must count code
+        # units, not code points, or the .aco byte layout is corrupted.
+        single_color = [(200, 40, 40)]
+        data = export_aco(single_color, name="🎨")
+
+        v1_size = 4 + len(single_color) * 10
+        # Skip the v2 header (version, count) and the color entry
+        # (mark + 4 x 16-bit channel values = 10 bytes).
+        name_block_offset = v1_size + 4 + 10
+
+        zero_mark, name_len = struct.unpack(
+            ">HH", data[name_block_offset:name_block_offset + 4]
+        )
+        assert zero_mark == 0
+
+        expected_name = "🎨 1\x00"
+        expected_utf16 = expected_name.encode("utf-16-be")
+        expected_len = len(expected_utf16) // 2
+
+        # The old buggy implementation would have reported len(expected_name)
+        # (code points), which is smaller than the UTF-16 code-unit count
+        # whenever the name contains a non-BMP character.
+        assert expected_len != len(expected_name)
+        assert name_len == expected_len
+
+        name_bytes = data[
+            name_block_offset + 4: name_block_offset + 4 + name_len * 2
+        ]
+        assert name_bytes == expected_utf16
+        assert name_bytes.decode("utf-16-be") == expected_name
+
 
 class TestExportCss:
     def test_root_block(self):

@@ -915,7 +915,8 @@ def export_aco(colors: list[tuple[int, int, int]], name: str = "Palette") -> byt
         data += struct.pack(">HHHHH", 0, r * 257, g * 257, b * 257, 0)
         color_name = f"{name} {i + 1}\x00"   # null-terminated
         name_utf16 = color_name.encode("utf-16-be")
-        data += struct.pack(">HH", 0, len(color_name))  # zero mark, char count incl. null
+        name_len = len(name_utf16) // 2  # UTF-16 code-unit count incl. null, not code points
+        data += struct.pack(">HH", 0, name_len)  # zero mark, code-unit count incl. null
         data += name_utf16
 
     return data
