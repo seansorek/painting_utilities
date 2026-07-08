@@ -658,33 +658,36 @@ def render_gradient_preview(
     return buf
 
 
-def render_palette_chart(colors: np.ndarray, counts: np.ndarray) -> plt.Figure:
+def render_palette_chart(colors: np.ndarray, counts: np.ndarray) -> io.BytesIO:
     total = counts.sum()
     percentages = counts / total
 
     fig, ax = plt.subplots(figsize=(max(8, len(colors) * 1.2), 2.8))
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
-    fig.patch.set_facecolor("#1a1a1a")
+    try:
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+        fig.patch.set_facecolor("#1a1a1a")
 
-    x = 0.0
-    for rgb, pct in zip(colors, percentages):
-        w = float(pct)
-        hex_color = f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
-        ax.add_patch(mpatches.Rectangle((x, 0.3), w, 0.6, color=hex_color))
-        cx = x + w / 2
-        name = nearest_color_name(tuple(int(v) for v in rgb))
-        pct_str = f"{pct * 100:.1f}%"
-        lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
-        txt_color = "white" if lum < 128 else "black"
-        ax.text(cx, 0.6, f"{pct_str}\n{hex_color}\n{name}",
-                ha="center", va="center", fontsize=6.5,
-                color=txt_color, fontweight="bold", wrap=True)
-        x += w
+        x = 0.0
+        for rgb, pct in zip(colors, percentages):
+            w = float(pct)
+            hex_color = f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+            ax.add_patch(mpatches.Rectangle((x, 0.3), w, 0.6, color=hex_color))
+            cx = x + w / 2
+            name = nearest_color_name(tuple(int(v) for v in rgb))
+            pct_str = f"{pct * 100:.1f}%"
+            lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+            txt_color = "white" if lum < 128 else "black"
+            ax.text(cx, 0.6, f"{pct_str}\n{hex_color}\n{name}",
+                    ha="center", va="center", fontsize=6.5,
+                    color=txt_color, fontweight="bold", wrap=True)
+            x += w
 
-    fig.tight_layout(pad=0.5)
-    return fig
+        fig.tight_layout(pad=0.5)
+        return render_chart_to_bytesio(fig)
+    finally:
+        plt.close(fig)
 
 
 def render_compare_chart(
@@ -792,51 +795,52 @@ def render_color_info_swatch(
     return buf
 
 
-def render_hue_saturation_chart(img: Image.Image) -> plt.Figure:
+def render_hue_saturation_chart(img: Image.Image) -> io.BytesIO:
     hsv = np.array(img.convert("HSV"))
     hue_deg = hsv[:, :, 0].flatten().astype(float) / 255 * 360
     sat_pct = hsv[:, :, 1].flatten().astype(float) / 255 * 100
 
     fig = plt.figure(figsize=(10, 4.5), facecolor="#1a1a1a")
+    try:
+        ax_polar = fig.add_subplot(1, 2, 1, polar=True)
+        bins = 36
+        hue_hist, hue_edges = np.histogram(hue_deg, bins=bins, range=(0, 360))
+        theta = np.deg2rad(hue_edges[:-1] + 5)
+        width = 2 * math.pi / bins
+        bar_colors = [plt.cm.hsv(h / 360) for h in hue_edges[:-1]]
+        ax_polar.bar(theta, hue_hist, width=width, bottom=0,
+                     color=bar_colors, alpha=0.85, edgecolor="none")
+        ax_polar.set_facecolor("#1a1a1a")
+        ax_polar.tick_params(colors="white", labelsize=7)
+        ax_polar.set_theta_zero_location("N")
+        ax_polar.set_theta_direction(-1)
+        ax_polar.set_title("Hue Distribution", color="white", pad=12, fontsize=11)
+        for label in ax_polar.get_xticklabels():
+            label.set_color("white")
+        for label in ax_polar.get_yticklabels():
+            label.set_color("#888888")
 
-    ax_polar = fig.add_subplot(1, 2, 1, polar=True)
-    bins = 36
-    hue_hist, hue_edges = np.histogram(hue_deg, bins=bins, range=(0, 360))
-    theta = np.deg2rad(hue_edges[:-1] + 5)
-    width = 2 * math.pi / bins
-    bar_colors = [plt.cm.hsv(h / 360) for h in hue_edges[:-1]]
-    ax_polar.bar(theta, hue_hist, width=width, bottom=0,
-                 color=bar_colors, alpha=0.85, edgecolor="none")
-    ax_polar.set_facecolor("#1a1a1a")
-    ax_polar.tick_params(colors="white", labelsize=7)
-    ax_polar.set_theta_zero_location("N")
-    ax_polar.set_theta_direction(-1)
-    ax_polar.set_title("Hue Distribution", color="white", pad=12, fontsize=11)
-    for label in ax_polar.get_xticklabels():
-        label.set_color("white")
-    for label in ax_polar.get_yticklabels():
-        label.set_color("#888888")
+        ax_sat = fig.add_subplot(1, 2, 2)
+        ax_sat.set_facecolor("#1a1a1a")
+        sat_hist, sat_edges = np.histogram(sat_pct, bins=10, range=(0, 100))
+        bar_x = (sat_edges[:-1] + sat_edges[1:]) / 2
+        ax_sat.bar(bar_x, sat_hist, width=9, color="#4fc3f7", alpha=0.85, edgecolor="none")
+        ax_sat.set_xlabel("Saturation (%)", color="white", fontsize=10)
+        ax_sat.set_ylabel("Pixel Count", color="white", fontsize=10)
+        ax_sat.set_title("Saturation Distribution", color="white", fontsize=11)
+        ax_sat.tick_params(colors="white")
+        ax_sat.spines[:].set_color("#444444")
 
-    ax_sat = fig.add_subplot(1, 2, 2)
-    ax_sat.set_facecolor("#1a1a1a")
-    sat_hist, sat_edges = np.histogram(sat_pct, bins=10, range=(0, 100))
-    bar_x = (sat_edges[:-1] + sat_edges[1:]) / 2
-    ax_sat.bar(bar_x, sat_hist, width=9, color="#4fc3f7", alpha=0.85, edgecolor="none")
-    ax_sat.set_xlabel("Saturation (%)", color="white", fontsize=10)
-    ax_sat.set_ylabel("Pixel Count", color="white", fontsize=10)
-    ax_sat.set_title("Saturation Distribution", color="white", fontsize=11)
-    ax_sat.tick_params(colors="white")
-    ax_sat.spines[:].set_color("#444444")
-
-    fig.tight_layout(pad=1.5)
-    return fig
+        fig.tight_layout(pad=1.5)
+        return render_chart_to_bytesio(fig)
+    finally:
+        plt.close(fig)
 
 
 def render_chart_to_bytesio(fig: plt.Figure) -> io.BytesIO:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=150,
                 facecolor=fig.get_facecolor())
-    plt.close(fig)
     buf.seek(0)
     return buf
 

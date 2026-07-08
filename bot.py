@@ -24,7 +24,6 @@ from analyzer import (
     compute_stats,
     render_palette_chart,
     render_hue_saturation_chart,
-    render_chart_to_bytesio,
     nearest_color_name,
     apply_gradient_map,
     GRADIENT_PRESETS,
@@ -446,8 +445,8 @@ async def analyze(
                 colors, counts = extract_dominant_colors(img, n=num_colors)
                 stats = compute_stats(img)
                 _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
-            palette_buf = render_chart_to_bytesio(render_palette_chart(colors, counts))
-            hue_sat_buf = render_chart_to_bytesio(render_hue_saturation_chart(img))
+            palette_buf = render_palette_chart(colors, counts)
+            hue_sat_buf = render_hue_saturation_chart(img)
             return colors, counts, stats, palette_buf, hue_sat_buf
 
         colors, counts, stats, palette_buf, hue_sat_buf = await _run_cpu(_work)
@@ -510,7 +509,7 @@ async def palette(
                 colors, counts = extract_dominant_colors(img, n=num_colors)
                 stats = compute_stats(img)
                 _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
-            palette_buf = render_chart_to_bytesio(render_palette_chart(colors, counts))
+            palette_buf = render_palette_chart(colors, counts)
             return colors, counts, palette_buf
 
         colors, counts, palette_buf = await _run_cpu(_work)
