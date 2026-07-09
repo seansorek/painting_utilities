@@ -922,11 +922,19 @@ async def compare_cmd(
         data_a = await image_a.read()
         data_b = await image_b.read()
 
+        def _get_colors(data):
+            cached = _cache_get(data, num_colors)
+            if cached:
+                colors, counts, _ = cached
+                return colors, counts
+            img = load_image_from_bytes(data)
+            colors, counts = extract_dominant_colors(img, n=num_colors)
+            _cache_set(data, num_colors, 0.0, 0.0, colors, counts, {})
+            return colors, counts
+
         def _work():
-            img_a = load_image_from_bytes(data_a)
-            img_b = load_image_from_bytes(data_b)
-            colors_a, counts_a = extract_dominant_colors(img_a, n=num_colors)
-            colors_b, counts_b = extract_dominant_colors(img_b, n=num_colors)
+            colors_a, counts_a = _get_colors(data_a)
+            colors_b, counts_b = _get_colors(data_b)
             compare_buf = render_compare_chart(
                 colors_a, counts_a, image_a.filename,
                 colors_b, counts_b, image_b.filename,
@@ -1051,9 +1059,14 @@ async def recolor_cmd(
         tgt_data = await target.read()
 
         def _work():
-            src_img = load_image_from_bytes(src_data)
+            cached = _cache_get(src_data, num_colors)
+            if cached:
+                colors, _counts, _ = cached
+            else:
+                src_img = load_image_from_bytes(src_data)
+                colors, _counts = extract_dominant_colors(src_img, n=num_colors)
+                _cache_set(src_data, num_colors, 0.0, 0.0, colors, _counts, {})
             tgt_img = load_image_from_bytes(tgt_data)
-            colors, _counts = extract_dominant_colors(src_img, n=num_colors)
             color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
             result = recolor_image(tgt_img, color_list)
             out_buf = io.BytesIO()
