@@ -929,7 +929,8 @@ async def compare_cmd(
                 return colors, counts
             img = load_image_from_bytes(data)
             colors, counts = extract_dominant_colors(img, n=num_colors)
-            _cache_set(data, num_colors, 0.0, 0.0, colors, counts, {})
+            stats = compute_stats(img)
+            _cache_set(data, num_colors, 0.0, 0.0, colors, counts, stats)
             return colors, counts
 
         def _work():
@@ -1065,7 +1066,8 @@ async def recolor_cmd(
             else:
                 src_img = load_image_from_bytes(src_data)
                 colors, _counts = extract_dominant_colors(src_img, n=num_colors)
-                _cache_set(src_data, num_colors, 0.0, 0.0, colors, _counts, {})
+                _stats = compute_stats(src_img)
+                _cache_set(src_data, num_colors, 0.0, 0.0, colors, _counts, _stats)
             tgt_img = load_image_from_bytes(tgt_data)
             color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
             result = recolor_image(tgt_img, color_list)

@@ -86,3 +86,62 @@ class TestRecolorCmdUsesCache:
                 "Recoloring against the same source image with a different "
                 "target should hit the cache and not re-run KMeans on the source"
             )
+
+
+class TestCacheStatsAreHonest:
+    """Regression tests for #72: /compare and /recolor must not poison the
+    shared _IMAGE_CACHE with an empty stats dict. A subsequent /analyze on
+    the same image bytes (same num_colors, default boosts) must succeed
+    rather than hit a KeyError on the fabricated stats slot.
+    """
+
+    @pytest.mark.asyncio
+    async def test_compare_then_analyze_same_image_succeeds(self, png_bytes):
+        data_a = png_bytes(make_solid_image((200, 40, 40)))
+        data_b = png_bytes(make_solid_image((40, 200, 40)))
+        image_a = _FakeAttachment(data_a, "a.png")
+        image_b = _FakeAttachment(data_b, "b.png")
+
+        ctx1 = _make_ctx(user_id=1)
+        await bot.compare_cmd.callback(ctx1, image_a, image_b, num_colors=4)
+
+        # Same bytes, same num_colors, default boosts -> hits the entry
+        # /compare just wrote into the shared cache.
+        analyze_image = _FakeAttachment(data_a, "a.png")
+        ctx2 = _make_ctx(user_id=2)  # different user avoids per-user cooldown
+        await bot.analyze.callback(
+            ctx2, analyze_image, num_colors=4,
+            show_rgb=False, show_cmyk=False,
+            saturation_boost=0.0, brightness_boost=0.0,
+        )
+
+        ctx2.followup.send.assert_awaited_once()
+        _, kwargs = ctx2.followup.send.call_args
+        assert "embed" in kwargs, (
+            "Expected /analyze to send an embed after /compare populated the "
+            f"cache, but got: {ctx2.followup.send.call_args}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_recolor_then_analyze_same_source_succeeds(self, png_bytes):
+        src_data = png_bytes(make_solid_image((200, 40, 40)))
+        source = _FakeAttachment(src_data, "source.png")
+        target = _FakeAttachment(png_bytes(make_solid_image((10, 10, 10))), "target.png")
+
+        ctx1 = _make_ctx(user_id=1)
+        await bot.recolor_cmd.callback(ctx1, source, target, num_colors=4)
+
+        analyze_image = _FakeAttachment(src_data, "source.png")
+        ctx2 = _make_ctx(user_id=2)  # different user avoids per-user cooldown
+        await bot.analyze.callback(
+            ctx2, analyze_image, num_colors=4,
+            show_rgb=False, show_cmyk=False,
+            saturation_boost=0.0, brightness_boost=0.0,
+        )
+
+        ctx2.followup.send.assert_awaited_once()
+        _, kwargs = ctx2.followup.send.call_args
+        assert "embed" in kwargs, (
+            "Expected /analyze to send an embed after /recolor populated the "
+            f"cache, but got: {ctx2.followup.send.call_args}"
+        )
