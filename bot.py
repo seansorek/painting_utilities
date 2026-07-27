@@ -1644,11 +1644,8 @@ async def _post_scheduled_challenges() -> None:
     # --- Phase 2: send due entries outside the lock (network-bound) ---
     # Collect the IDs of all entries seen in Phase 1 so we can distinguish
     # newly-added entries (by /daily_challenge) from stale ones in Phase 3.
-    phase1_ids: set[str] = set()
-    for c in schedule:
-        cid = c.get("id")
-        if cid:
-            phase1_ids.add(cid)
+    phase1_ids: set[str] = {c["id"] for c, _ in due if c.get("id")}
+    remaining_ids: set[str] = {c["id"] for c in remaining if c.get("id")}
 
     # IDs of challenges that failed delivery and should be retried.
     # For entries without an ID, collect them in failed_noID for fallback.
@@ -1688,8 +1685,8 @@ async def _post_scheduled_challenges() -> None:
             elif cid not in phase1_ids:
                 # Entry added concurrently after Phase 1 -- keep it.
                 merged.append(c)
-            elif cid in failed_ids:
-                # Delivery failed -- keep for retry.
+            elif cid in remaining_ids or cid in failed_ids:
+                # Not yet due (future-dated) or delivery failed -- keep for retry.
                 merged.append(c)
             # else: successfully sent or expired -- drop it.
         await asyncio.to_thread(_save_schedule, merged)
