@@ -322,6 +322,29 @@ class TestPostScheduledChallengesBugB(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["content"], "later")
 
+    async def test_future_entry_with_id_is_not_sent_and_stays_in_schedule(self):
+        """Regression test for #71: a future-dated entry that carries an `id`
+        (as every entry created by /daily_challenge does) must survive a tick,
+        not be silently dropped."""
+        entry = {
+            "id": "fut-1",
+            "guild_id": "1",
+            "channel_id": "10",
+            "content": "later",
+            "post_at": _future_iso(5),
+        }
+        self.mock_load.return_value = [entry]
+
+        with patch.object(bot_module, "_send_daily_challenge", new=AsyncMock(return_value=True)) as mock_send:
+            await bot_module._post_scheduled_challenges()
+            mock_send.assert_not_called()
+
+        self.assertTrue(self.mock_save.called, "_save_schedule should be called")
+        saved = self.mock_save.call_args[0][0]
+        self.assertEqual(len(saved), 1, "Future-dated entry with an id must be preserved")
+        self.assertEqual(saved[0]["content"], "later")
+        self.assertEqual(saved[0]["id"], "fut-1")
+
     async def test_mixed_success_and_failure(self):
         """Only the successful entry is pruned; the failed one remains."""
         success_entry = {"guild_id": "1", "channel_id": "10", "content": "ok", "post_at": _past_iso(1)}
