@@ -608,6 +608,70 @@ class TestScheduledLoopSurvivesBadChannelId(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.mock_save.call_args[0][0], [])
 
 
+class TestScheduledLoopErrorHandlerRestart(unittest.IsolatedAsyncioTestCase):
+    """PR #76 review (discussion_r3702675189): pycord invokes the loop's
+    .error handler from *inside* the still-finishing loop task, so
+    is_running() reports True at that point regardless of whether the loop
+    is about to actually stop. Checking it synchronously in the handler (as
+    the original fix did) always skips start(), so any exception that
+    escapes the per-entry send guard still permanently kills scheduled
+    delivery -- the exact failure mode #76 was supposed to close off.
+    """
+
+    async def asyncSetUp(self):
+        self._sleep_patch = patch.object(bot_module.asyncio, "sleep", AsyncMock())
+        self.mock_sleep = self._sleep_patch.start()
+
+    async def asyncTearDown(self):
+        self._sleep_patch.stop()
+
+    async def test_error_handler_does_not_call_start_synchronously(self):
+        """The handler itself must never call start() directly -- only
+        schedule the deferred restart -- since is_running() is unreliable
+        at the point the handler runs."""
+        with patch.object(bot_module.asyncio, "create_task") as mock_create_task:
+            with patch.object(bot_module._post_scheduled_challenges, "start") as mock_start:
+                await bot_module._post_scheduled_challenges_error(RuntimeError("boom"))
+                mock_start.assert_not_called()
+                mock_create_task.assert_called_once()
+                # Avoid a "coroutine was never awaited" warning: create_task
+                # is mocked out, so the coroutine it was handed is never
+                # actually scheduled/run.
+                mock_create_task.call_args[0][0].close()
+
+    async def test_restart_waits_for_is_running_to_go_false_before_starting(self):
+        """is_running() reporting True for a few polls (simulating the loop
+        task still finishing up) must not cause the restart to be skipped;
+        it must retry until is_running() is False, then start() exactly
+        once."""
+        is_running_results = [True, True, False]
+        with patch.object(
+            bot_module._post_scheduled_challenges, "is_running",
+            side_effect=is_running_results,
+        ) as mock_is_running:
+            with patch.object(bot_module._post_scheduled_challenges, "start") as mock_start:
+                await bot_module._restart_scheduled_challenges_loop()
+
+        self.assertEqual(mock_is_running.call_count, 3)
+        mock_start.assert_called_once()
+
+    async def test_restart_gives_up_if_is_running_never_goes_false(self):
+        """A loop that never actually reports stopped must not retry
+        forever or raise -- it should give up after a bounded number of
+        attempts and never call start() (which would raise on a genuinely
+        still-running loop)."""
+        with patch.object(
+            bot_module._post_scheduled_challenges, "is_running", return_value=True,
+        ) as mock_is_running:
+            with patch.object(bot_module._post_scheduled_challenges, "start") as mock_start:
+                await bot_module._restart_scheduled_challenges_loop()
+
+        self.assertEqual(
+            mock_is_running.call_count, bot_module._LOOP_RESTART_POLL_MAX_ATTEMPTS
+        )
+        mock_start.assert_not_called()
+
+
 class TestDailyChallengeChannelIdValidation(unittest.IsolatedAsyncioTestCase):
     """Issue #75: /daily_challenge must validate channel_id before scheduling.
 

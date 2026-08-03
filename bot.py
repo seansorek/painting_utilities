@@ -93,6 +93,13 @@ MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 # for an extended period or a guild channel is permanently misconfigured.
 _CHALLENGE_EXPIRY_HOURS = 24
 
+# How long to poll (and how many times) for the crashed daily-challenge loop
+# task to actually finish before giving up on restarting it. See
+# _post_scheduled_challenges_error below for why this can't just check
+# is_running() once.
+_LOOP_RESTART_POLL_INTERVAL_SECONDS = 1
+_LOOP_RESTART_POLL_MAX_ATTEMPTS = 10
+
 # message_content is intentionally NOT enabled: it is a privileged intent (needs
 # Discord approval + verification at 100 servers) and nothing here reads message
 # text — on_message only inspects attachments, which arrive without the intent.
@@ -1724,11 +1731,36 @@ async def _post_scheduled_challenges_error(error: Exception) -> None:
     `on_ready`. Without this handler, any future bug would silently and
     permanently stop scheduled posting for every guild until the process is
     restarted. Log it and restart the loop instead.
+
+    Pycord invokes this handler from *inside* the still-finishing loop
+    task, so `is_running()` reports `True` here regardless of whether the
+    loop is about to actually stop -- checking it synchronously (as a
+    naive restart would) always skips `start()`, so failures outside the
+    per-entry send guard would still permanently stop scheduled posting.
+    Restarting is deferred to a separate task that polls until the crashed
+    task has genuinely finished.
     """
     traceback.print_exc()
     print("Daily challenge loop crashed; restarting it.")
-    if not _post_scheduled_challenges.is_running():
-        _post_scheduled_challenges.start()
+    asyncio.create_task(_restart_scheduled_challenges_loop())
+
+
+async def _restart_scheduled_challenges_loop() -> None:
+    """Poll until the crashed loop task has actually finished, then restart it.
+
+    See `_post_scheduled_challenges_error` for why `is_running()` can't be
+    checked synchronously from within the error handler itself.
+    """
+    for _ in range(_LOOP_RESTART_POLL_MAX_ATTEMPTS):
+        if not _post_scheduled_challenges.is_running():
+            _post_scheduled_challenges.start()
+            return
+        await asyncio.sleep(_LOOP_RESTART_POLL_INTERVAL_SECONDS)
+    print(
+        "Daily challenge loop: still marked running "
+        f"{_LOOP_RESTART_POLL_MAX_ATTEMPTS * _LOOP_RESTART_POLL_INTERVAL_SECONDS}s "
+        "after crash; giving up on restart."
+    )
 
 
 # ---------------------------------------------------------------------------
