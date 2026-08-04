@@ -145,6 +145,14 @@ def _make_ext_stub():
 
             wrapper.start = lambda: None
             wrapper.is_running = lambda: False
+
+            def _error(error_fn):
+                # Mimics @loop.error -- just stores the handler, no invocation
+                # wiring needed for the unit tests.
+                wrapper._error_handler = error_fn
+                return error_fn
+
+            wrapper.error = _error
             return wrapper
 
     tasks_mod.loop = _LoopDecorator
@@ -521,6 +529,262 @@ class TestPostScheduledChallengesTOCTOU(unittest.IsolatedAsyncioTestCase):
         # Both the failed entry (retry) and the concurrent entry are kept.
         self.assertIn("due-1", saved_ids)
         self.assertIn("concurrent-2", saved_ids)
+
+
+class TestScheduledLoopSurvivesBadChannelId(unittest.IsolatedAsyncioTestCase):
+    """Issue #75: a malformed channel_id already on disk (e.g. from a legacy
+    entry, or one that slipped past validation) must not crash the loop --
+    _send_daily_challenge must catch the ValueError from int() and return
+    False, and _post_scheduled_challenges must continue on to other entries
+    and to future ticks rather than propagating the exception."""
+
+    async def asyncSetUp(self):
+        self._load_patch = patch.object(bot_module, "_load_schedule")
+        self._save_patch = patch.object(bot_module, "_save_schedule")
+        self.mock_load = self._load_patch.start()
+        self.mock_save = self._save_patch.start()
+
+    async def asyncTearDown(self):
+        self._load_patch.stop()
+        self._save_patch.stop()
+
+    async def test_send_daily_challenge_returns_false_for_non_numeric_channel_id(self):
+        """A non-numeric channel_id must not raise ValueError out of
+        _send_daily_challenge; it must be treated as a failed send."""
+        result = await bot_module._send_daily_challenge(
+            {"guild_id": "1", "channel_id": "#art-share", "day": "Day 1", "post_at": _past_iso()}
+        )
+        self.assertFalse(result)
+
+    async def test_loop_survives_and_processes_other_guilds(self):
+        """One entry with a malformed channel_id must not stop delivery to
+        other, valid guilds in the same tick -- and must not raise."""
+        bad_channel_entry = {
+            "id": "bad-channel-1",
+            "guild_id": "1",
+            "channel_id": "not-a-number",
+            "day": "Day 1",
+            "post_at": _past_iso(),
+        }
+        good_channel = MagicMock()
+        good_channel.create_thread = AsyncMock()
+
+        self.mock_load.return_value = [bad_channel_entry]
+
+        with patch.object(bot_module.bot, "get_channel", return_value=good_channel):
+            # Must not raise -- this is the core regression check: previously
+            # the ValueError from int("not-a-number") propagated out of
+            # _send_daily_challenge, out of the for-loop, and out of
+            # _post_scheduled_challenges, killing the tasks.loop forever.
+            await bot_module._post_scheduled_challenges()
+
+        # The bad entry failed (channel_id is not numeric) and is kept for retry,
+        # not silently lost and not fatal to the tick.
+        saved = self.mock_save.call_args[0][0]
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["id"], "bad-channel-1")
+
+    async def test_loop_can_run_again_after_a_bad_entry(self):
+        """A second tick after a bad-channel_id entry still runs normally --
+        proof the loop function itself never raised and is still callable."""
+        bad_channel_entry = {
+            "id": "bad-channel-2",
+            "guild_id": "1",
+            "channel_id": "totally-invalid",
+            "day": "Day 1",
+            "post_at": _past_iso(),
+        }
+        self.mock_load.return_value = [bad_channel_entry]
+
+        # First tick: must not raise despite the bad channel_id.
+        await bot_module._post_scheduled_challenges()
+
+        # Second tick, now with a clean schedule -- proves the loop function
+        # is still healthy and callable (i.e. it wasn't left in a broken state).
+        self.mock_load.return_value = []
+        await bot_module._post_scheduled_challenges()
+
+        self.assertEqual(self.mock_save.call_count, 2)
+        self.assertEqual(self.mock_save.call_args[0][0], [])
+
+
+class TestScheduledLoopErrorHandlerRestart(unittest.IsolatedAsyncioTestCase):
+    """PR #76 review (discussion_r3702675189): pycord invokes the loop's
+    .error handler from *inside* the still-finishing loop task, so
+    is_running() reports True at that point regardless of whether the loop
+    is about to actually stop. Checking it synchronously in the handler (as
+    the original fix did) always skips start(), so any exception that
+    escapes the per-entry send guard still permanently kills scheduled
+    delivery -- the exact failure mode #76 was supposed to close off.
+    """
+
+    async def asyncSetUp(self):
+        self._sleep_patch = patch.object(bot_module.asyncio, "sleep", AsyncMock())
+        self.mock_sleep = self._sleep_patch.start()
+
+    async def asyncTearDown(self):
+        self._sleep_patch.stop()
+
+    async def test_error_handler_does_not_call_start_synchronously(self):
+        """The handler itself must never call start() directly -- only
+        schedule the deferred restart -- since is_running() is unreliable
+        at the point the handler runs."""
+        with patch.object(bot_module.asyncio, "create_task") as mock_create_task:
+            with patch.object(bot_module._post_scheduled_challenges, "start") as mock_start:
+                await bot_module._post_scheduled_challenges_error(RuntimeError("boom"))
+                mock_start.assert_not_called()
+                mock_create_task.assert_called_once()
+                # Avoid a "coroutine was never awaited" warning: create_task
+                # is mocked out, so the coroutine it was handed is never
+                # actually scheduled/run.
+                mock_create_task.call_args[0][0].close()
+
+    async def test_restart_waits_for_is_running_to_go_false_before_starting(self):
+        """is_running() reporting True for a few polls (simulating the loop
+        task still finishing up) must not cause the restart to be skipped;
+        it must retry until is_running() is False, then start() exactly
+        once."""
+        is_running_results = [True, True, False]
+        with patch.object(
+            bot_module._post_scheduled_challenges, "is_running",
+            side_effect=is_running_results,
+        ) as mock_is_running:
+            with patch.object(bot_module._post_scheduled_challenges, "start") as mock_start:
+                await bot_module._restart_scheduled_challenges_loop()
+
+        self.assertEqual(mock_is_running.call_count, 3)
+        mock_start.assert_called_once()
+
+    async def test_restart_gives_up_if_is_running_never_goes_false(self):
+        """A loop that never actually reports stopped must not retry
+        forever or raise -- it should give up after a bounded number of
+        attempts and never call start() (which would raise on a genuinely
+        still-running loop)."""
+        with patch.object(
+            bot_module._post_scheduled_challenges, "is_running", return_value=True,
+        ) as mock_is_running:
+            with patch.object(bot_module._post_scheduled_challenges, "start") as mock_start:
+                await bot_module._restart_scheduled_challenges_loop()
+
+        self.assertEqual(
+            mock_is_running.call_count, bot_module._LOOP_RESTART_POLL_MAX_ATTEMPTS
+        )
+        mock_start.assert_not_called()
+
+
+class TestDailyChallengeChannelIdValidation(unittest.IsolatedAsyncioTestCase):
+    """Issue #75: /daily_challenge must validate channel_id before scheduling.
+
+    (a) Non-numeric / malformed channel_id is rejected at command time.
+    (b) A numeric channel_id that doesn't resolve to a real, accessible
+        channel is rejected.
+    (c) A numeric channel_id that resolves to a channel in a *different*
+        guild is rejected.
+    (d) A valid channel_id in the same guild is accepted and scheduled.
+    """
+
+    def _make_ctx(self, guild_id=42):
+        ctx = MagicMock(spec=_discord_stub.ApplicationContext)
+        ctx.guild_id = guild_id
+        ctx.defer = AsyncMock()
+        ctx.followup = MagicMock()
+        ctx.followup.send = AsyncMock()
+        return ctx
+
+    async def asyncSetUp(self):
+        self._load_patch = patch.object(bot_module, "_load_schedule", return_value=[])
+        self._save_patch = patch.object(bot_module, "_save_schedule")
+        self.mock_load = self._load_patch.start()
+        self.mock_save = self._save_patch.start()
+
+    async def asyncTearDown(self):
+        self._load_patch.stop()
+        self._save_patch.stop()
+
+    @staticmethod
+    def _option_defaults():
+        """Default values py-cord would normally supply for the optional
+        Option-typed parameters. The stub's discord.Option(...) evaluates to
+        None at import time (it's used purely as a type annotation, not a
+        Python-level default), so calling the command function directly
+        requires passing these explicitly."""
+        return dict(
+            release_time="18:00",
+            release_date=None,
+            reference=None,
+            minimum_time=None,
+            extra_challenge=None,
+            description=None,
+        )
+
+    async def test_non_numeric_channel_id_is_rejected(self):
+        ctx = self._make_ctx()
+
+        await bot_module.daily_challenge(
+            ctx, day="Day 1", channel_id="#art-share", **self._option_defaults(),
+        )
+
+        ctx.followup.send.assert_awaited_once()
+        (msg,), kwargs = ctx.followup.send.call_args
+        self.assertIn("not a valid channel ID", msg)
+        self.assertTrue(kwargs.get("ephemeral"))
+        # Must not have been scheduled.
+        self.mock_save.assert_not_called()
+
+    async def test_unresolvable_channel_id_is_rejected(self):
+        ctx = self._make_ctx()
+
+        with patch.object(bot_module.bot, "get_channel", return_value=None):
+            await bot_module.daily_challenge(
+                ctx, day="Day 1", channel_id="999999999999999999", **self._option_defaults(),
+            )
+
+        ctx.followup.send.assert_awaited_once()
+        (msg,), kwargs = ctx.followup.send.call_args
+        self.assertIn("can't see a channel", msg)
+        self.mock_save.assert_not_called()
+
+    async def test_channel_id_in_different_guild_is_rejected(self):
+        ctx = self._make_ctx(guild_id=42)
+
+        other_guild = MagicMock()
+        other_guild.id = 999
+        foreign_channel = MagicMock()
+        foreign_channel.guild = other_guild
+
+        with patch.object(bot_module.bot, "get_channel", return_value=foreign_channel):
+            await bot_module.daily_challenge(
+                ctx, day="Day 1", channel_id="123", **self._option_defaults(),
+            )
+
+        ctx.followup.send.assert_awaited_once()
+        (msg,), kwargs = ctx.followup.send.call_args
+        self.assertIn("doesn't belong to this server", msg)
+        self.mock_save.assert_not_called()
+
+    async def test_valid_channel_id_in_same_guild_is_accepted(self):
+        ctx = self._make_ctx(guild_id=42)
+
+        same_guild = MagicMock()
+        same_guild.id = 42
+        valid_channel = MagicMock()
+        valid_channel.guild = same_guild
+
+        with patch.object(bot_module.bot, "get_channel", return_value=valid_channel), \
+             patch.object(bot_module, "_load_references", return_value=[]), \
+             patch.object(bot_module, "_parse_release_datetime", return_value=_future_iso(1)):
+            await bot_module.daily_challenge(
+                ctx, day="Day 1", channel_id="123", **self._option_defaults(),
+            )
+
+        self.mock_save.assert_called_once()
+        saved = self.mock_save.call_args[0][0]
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["channel_id"], "123")
+        # Success message, not an error.
+        ctx.followup.send.assert_awaited_once()
+        (msg,), _ = ctx.followup.send.call_args
+        self.assertIn("scheduled", msg)
 
 
 if __name__ == "__main__":

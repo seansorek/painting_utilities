@@ -93,6 +93,13 @@ MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 # for an extended period or a guild channel is permanently misconfigured.
 _CHALLENGE_EXPIRY_HOURS = 24
 
+# How long to poll (and how many times) for the crashed daily-challenge loop
+# task to actually finish before giving up on restarting it. See
+# _post_scheduled_challenges_error below for why this can't just check
+# is_running() once.
+_LOOP_RESTART_POLL_INTERVAL_SECONDS = 1
+_LOOP_RESTART_POLL_MAX_ATTEMPTS = 10
+
 # message_content is intentionally NOT enabled: it is a privileged intent (needs
 # Discord approval + verification at 100 servers) and nothing here reads message
 # text — on_message only inspects attachments, which arrive without the intent.
@@ -1574,29 +1581,40 @@ def _format_daily_post(challenge: dict) -> str:
 
 
 async def _send_daily_challenge(challenge: dict) -> bool:
-    """Post a single scheduled challenge. Returns True on success, False on failure."""
-    guild_id = challenge.get("guild_id")
-    if not guild_id:
-        print("Daily challenge: missing guild_id, skipping.")
-        return False
-    channel_id = challenge.get("channel_id") or _get_guild_channel(int(guild_id))
-    if not channel_id:
-        print(f"Daily challenge: no channel configured for guild {guild_id}, skipping.")
-        return False
-    channel = bot.get_channel(int(channel_id))
-    if channel is None:
-        print(f"Daily challenge: channel {channel_id} not found for guild {guild_id}.")
-        return False
-    content = _format_daily_post(challenge)
-    day = challenge.get("day", "")
-    thread_name = f"[ DAILY GESTURE ] — {day}" if day else "[ DAILY GESTURE ]"
-    daily_role_id = _get_guild_daily_role(int(guild_id))
-    allowed = discord.AllowedMentions(
-        everyone=False,
-        users=False,
-        roles=[discord.Object(int(daily_role_id))] if daily_role_id else False,
-    )
+    """Post a single scheduled challenge. Returns True on success, False on failure.
+
+    Everything in this function -- including the int() conversions of
+    guild_id/channel_id/daily_role_id -- is wrapped in a single try/except so
+    that a malformed or stale entry (e.g. a non-numeric channel_id, or a
+    channel/guild that no longer exists) can never raise out of this
+    function. This function is called from inside `_post_scheduled_challenges`,
+    which is a `tasks.loop`; any unhandled exception there would permanently
+    kill the loop for every guild until the process is restarted. Returning
+    False here just means the entry is retried (or eventually expired) on a
+    later tick, which is the safe behavior.
+    """
     try:
+        guild_id = challenge.get("guild_id")
+        if not guild_id:
+            print("Daily challenge: missing guild_id, skipping.")
+            return False
+        channel_id = challenge.get("channel_id") or _get_guild_channel(int(guild_id))
+        if not channel_id:
+            print(f"Daily challenge: no channel configured for guild {guild_id}, skipping.")
+            return False
+        channel = bot.get_channel(int(channel_id))
+        if channel is None:
+            print(f"Daily challenge: channel {channel_id} not found for guild {guild_id}.")
+            return False
+        content = _format_daily_post(challenge)
+        day = challenge.get("day", "")
+        thread_name = f"[ DAILY GESTURE ] — {day}" if day else "[ DAILY GESTURE ]"
+        daily_role_id = _get_guild_daily_role(int(guild_id))
+        allowed = discord.AllowedMentions(
+            everyone=False,
+            users=False,
+            roles=[discord.Object(int(daily_role_id))] if daily_role_id else False,
+        )
         if isinstance(channel, discord.ForumChannel):
             await channel.create_thread(name=thread_name, content=content, allowed_mentions=allowed)
         else:
@@ -1662,7 +1680,14 @@ async def _post_scheduled_challenges() -> None:
             )
             continue
 
-        ok = await _send_daily_challenge(challenge)
+        try:
+            ok = await _send_daily_challenge(challenge)
+        except Exception:
+            # Defense in depth: _send_daily_challenge already catches everything
+            # internally, but a single bad entry must never be able to escape
+            # this loop body and kill the tasks.loop for every other guild.
+            traceback.print_exc()
+            ok = False
         if not ok:
             cid = challenge.get("id")
             if cid:
@@ -1692,6 +1717,50 @@ async def _post_scheduled_challenges() -> None:
                 merged.append(c)
             # else: successfully sent or expired -- drop it.
         await asyncio.to_thread(_save_schedule, merged)
+
+
+@_post_scheduled_challenges.error
+async def _post_scheduled_challenges_error(error: Exception) -> None:
+    """Last-resort safety net.
+
+    `_post_scheduled_challenges` and `_send_daily_challenge` already guard
+    against per-entry failures so a single bad channel_id/guild can't kill
+    the loop. This handler exists for any *unanticipated* exception that
+    still escapes: `discord.ext.tasks` stops a loop on an unhandled
+    exception in its body, and the only `.start()` call happens once, in
+    `on_ready`. Without this handler, any future bug would silently and
+    permanently stop scheduled posting for every guild until the process is
+    restarted. Log it and restart the loop instead.
+
+    Pycord invokes this handler from *inside* the still-finishing loop
+    task, so `is_running()` reports `True` here regardless of whether the
+    loop is about to actually stop -- checking it synchronously (as a
+    naive restart would) always skips `start()`, so failures outside the
+    per-entry send guard would still permanently stop scheduled posting.
+    Restarting is deferred to a separate task that polls until the crashed
+    task has genuinely finished.
+    """
+    traceback.print_exc()
+    print("Daily challenge loop crashed; restarting it.")
+    asyncio.create_task(_restart_scheduled_challenges_loop())
+
+
+async def _restart_scheduled_challenges_loop() -> None:
+    """Poll until the crashed loop task has actually finished, then restart it.
+
+    See `_post_scheduled_challenges_error` for why `is_running()` can't be
+    checked synchronously from within the error handler itself.
+    """
+    for _ in range(_LOOP_RESTART_POLL_MAX_ATTEMPTS):
+        if not _post_scheduled_challenges.is_running():
+            _post_scheduled_challenges.start()
+            return
+        await asyncio.sleep(_LOOP_RESTART_POLL_INTERVAL_SECONDS)
+    print(
+        "Daily challenge loop: still marked running "
+        f"{_LOOP_RESTART_POLL_MAX_ATTEMPTS * _LOOP_RESTART_POLL_INTERVAL_SECONDS}s "
+        "after crash; giving up on restart."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1751,6 +1820,32 @@ async def daily_challenge(
     ),
 ):
     await ctx.defer(ephemeral=True)
+
+    if channel_id:
+        if not channel_id.isdigit():
+            await ctx.followup.send(
+                f"`{channel_id}` is not a valid channel ID. "
+                "Right-click the channel and choose \"Copy Channel ID\" "
+                "(Developer Mode must be enabled), then paste just the number.",
+                ephemeral=True,
+            )
+            return
+        resolved_channel = bot.get_channel(int(channel_id))
+        if resolved_channel is None:
+            await ctx.followup.send(
+                f"I can't see a channel with ID `{channel_id}`. It may not exist, "
+                "may have been deleted, or I may not have access to it.",
+                ephemeral=True,
+            )
+            return
+        resolved_guild = getattr(resolved_channel, "guild", None)
+        if resolved_guild is None or resolved_guild.id != ctx.guild_id:
+            await ctx.followup.send(
+                f"Channel `{channel_id}` doesn't belong to this server. "
+                "`channel_id` must be a channel in the server you're running this command from.",
+                ephemeral=True,
+            )
+            return
 
     try:
         post_at_iso = _parse_release_datetime(release_time, release_date)
