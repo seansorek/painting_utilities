@@ -1332,6 +1332,78 @@ COMMAND_DOCS = {
         ],
         "output": "Embed with suggested hex colors and labels, `harmony.png` swatch chart",
     },
+    "daily_challenge": {
+        "summary": "Schedule a daily gesture thread in the configured forum channel (admin only)",
+        "description": (
+            "Queues a daily art prompt to be posted automatically at the given time in the "
+            "server's configured forum channel (set via /set_daily_channel). If `reference` is "
+            "omitted, one is picked at random from references.json; if `minimum_time` is omitted, "
+            "a random 1–15 minute value is used."
+        ),
+        "params": [
+            ("`day`",             "required",                     "Label used in the thread title, e.g. `Day 42` or `Saturday`"),
+            ("`release_time`",    "text, default `18:00`",         "Time to post (ET), e.g. `18:00`, `6pm`, `6:30pm`"),
+            ("`release_date`",    "text, optional",                "Date to post (ET), e.g. `2026-06-20`, `June 20`, `tomorrow`. Defaults to today/tomorrow"),
+            ("`reference`",       "Discord image URL, optional",   "Reference image. Omit to pick randomly from references.json"),
+            ("`minimum_time`",    "text, optional",                "Minimum time, e.g. `10 minutes`. Omit for a random 1–15 min value"),
+            ("`extra_challenge`", "text, optional",                "Optional extra challenge text"),
+            ("`description`",     "text, optional",                "Notes stored with the schedule entry but not shown in the post"),
+            ("`channel_id`",      "text, optional",                "Channel ID to post in, overriding the server default"),
+        ],
+        "output": "Ephemeral confirmation; the prompt posts automatically to the forum channel at the scheduled time",
+    },
+    "list_schedule": {
+        "summary": "List all pending daily art prompts scheduled for this server (admin only)",
+        "description": "Shows every not-yet-posted challenge queued for this server, sorted by post time, with a short description snippet.",
+        "params": [],
+        "output": "Ephemeral numbered list of scheduled challenges with post time and description snippet",
+    },
+    "delete_challenge": {
+        "summary": "Delete a pending daily art prompt from the schedule (admin only)",
+        "description": "Removes a queued challenge before it posts. Pick it from the autocomplete list of this server's pending challenges.",
+        "params": [
+            ("`challenge`", "required, autocomplete", "The scheduled challenge to delete"),
+        ],
+        "output": "Ephemeral confirmation, or a not-found message if it already posted or was deleted",
+    },
+    "edit_challenge": {
+        "summary": "Edit a pending daily art prompt in the schedule (admin only)",
+        "description": "Updates one or more fields of a queued challenge before it posts. Only the fields you provide are changed.",
+        "params": [
+            ("`challenge`",       "required, autocomplete", "The scheduled challenge to edit"),
+            ("`new_day`",         "text, optional",         "New label, e.g. `Day 43`"),
+            ("`description`",     "text, optional",         "New notes (stored but not shown in the post)"),
+            ("`release_time`",    "text, optional",         "New post time (ET), e.g. `18:00`, `6pm`"),
+            ("`reference`",       "text, optional",         "New reference image URL"),
+            ("`minimum_time`",    "text, optional",         "New minimum time, e.g. `10 minutes`"),
+            ("`extra_challenge`", "text, optional",         "New extra challenge text"),
+        ],
+        "output": "Ephemeral confirmation, or a not-found/no-changes message",
+    },
+    "set_daily_channel": {
+        "summary": "Set the forum channel where daily art prompts are posted (admin only)",
+        "description": "Configures which forum channel this server's /daily_challenge posts land in.",
+        "params": [
+            ("`channel`", "required", "The forum channel to post daily prompts in"),
+        ],
+        "output": "Ephemeral confirmation",
+    },
+    "set_daily_role": {
+        "summary": "Set the role pinged in daily art prompt posts (admin only)",
+        "description": "Configures which role gets pinged each time a daily prompt is posted. @everyone is not allowed.",
+        "params": [
+            ("`role`", "required", "Role to ping when a daily prompt is posted"),
+        ],
+        "output": "Ephemeral confirmation",
+    },
+    "set_required_role": {
+        "summary": "Set the role required to use this bot in this server (admin only)",
+        "description": "Restricts bot usage to members with the given role. Server admins always bypass this restriction.",
+        "params": [
+            ("`role`", "required", "Role required to use the bot. Admins always bypass this"),
+        ],
+        "output": "Ephemeral confirmation",
+    },
 }
 
 _HELP_CHOICES = list(COMMAND_DOCS.keys())
@@ -1363,7 +1435,7 @@ async def help_cmd(
         param_lines = "\n".join(
             f"**{p}** ({default}) — {desc}" for p, default, desc in doc["params"]
         )
-        embed.add_field(name="Parameters", value=param_lines, inline=False)
+        embed.add_field(name="Parameters", value=param_lines or "None", inline=False)
         embed.add_field(name="Output",     value=doc["output"], inline=False)
         await ctx.respond(embed=embed)
 
