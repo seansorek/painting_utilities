@@ -190,6 +190,32 @@ def _is_guild_admin(member: discord.Member) -> bool:
     return p.administrator or p.manage_guild
 
 
+async def _require_guild_admin(ctx: discord.ApplicationContext) -> bool:
+    """Runtime enforcement for admin-only commands.
+
+    ``@discord.default_permissions(manage_guild=True)`` only sets the
+    *default* command-permission UI in Discord — a guild admin can override
+    it to expose the command to any role or member. This checks the caller's
+    live, resolved ``discord.Member`` permissions so the command's real
+    guard does not depend on that overridable default.
+
+    Sends an ephemeral rejection (mirroring the reject-and-explain style
+    used elsewhere in this bot) and returns False when the caller is not a
+    guild admin. Returns True when authorized.
+    """
+    member = ctx.guild.get_member(ctx.author.id) if ctx.guild else None
+    if not isinstance(member, discord.Member):
+        member = ctx.author if isinstance(ctx.author, discord.Member) else None
+    if member is not None and _is_guild_admin(member):
+        return True
+    message = "You need the **Manage Server** permission to use this command."
+    if ctx.response.is_done():
+        await ctx.followup.send(message, ephemeral=True)
+    else:
+        await ctx.respond(message, ephemeral=True)
+    return False
+
+
 @bot.check
 async def _require_bot_role(ctx: discord.ApplicationContext) -> bool:
     if not ctx.guild:
@@ -1892,6 +1918,8 @@ async def daily_challenge(
     ),
 ):
     await ctx.defer(ephemeral=True)
+    if not await _require_guild_admin(ctx):
+        return
 
     if channel_id:
         if not channel_id.isdigit():
@@ -2024,6 +2052,8 @@ async def _challenge_autocomplete(ctx: discord.AutocompleteContext) -> list[disc
 @discord.default_permissions(manage_guild=True)
 async def list_schedule(ctx: discord.ApplicationContext):
     await ctx.defer(ephemeral=True)
+    if not await _require_guild_admin(ctx):
+        return
     guild_id = str(ctx.guild_id)
     async with _SCHEDULE_LOCK:
         schedule = await asyncio.to_thread(_load_schedule)
@@ -2069,6 +2099,8 @@ async def delete_challenge(
     ),
 ):
     await ctx.defer(ephemeral=True)
+    if not await _require_guild_admin(ctx):
+        return
     guild_id = str(ctx.guild_id)
     async with _SCHEDULE_LOCK:
         schedule = await asyncio.to_thread(_load_schedule)
@@ -2140,6 +2172,8 @@ async def edit_challenge(
     ),
 ):
     await ctx.defer(ephemeral=True)
+    if not await _require_guild_admin(ctx):
+        return
 
     if all(v is None for v in (new_day, description, release_time, reference, minimum_time, extra_challenge)):
         await ctx.followup.send("No changes provided.", ephemeral=True)
@@ -2218,6 +2252,8 @@ async def set_daily_channel(
     ctx: discord.ApplicationContext,
     channel: discord.Option(discord.ForumChannel, description="The forum channel to post daily prompts in"),
 ):
+    if not await _require_guild_admin(ctx):
+        return
     await _set_guild_channel(ctx.guild_id, str(channel.id))
     await ctx.respond(
         f"✓ Daily challenge channel set to {channel.mention}.",
@@ -2239,6 +2275,8 @@ async def set_daily_role(
     ctx: discord.ApplicationContext,
     role: discord.Option(discord.Role, description="Role to ping when a daily prompt is posted"),
 ):
+    if not await _require_guild_admin(ctx):
+        return
     if role.id == ctx.guild_id:
         await ctx.respond(
             "Can't use @everyone as the daily-ping role. Pick a non-default role.",
@@ -2266,6 +2304,8 @@ async def set_required_role(
     ctx: discord.ApplicationContext,
     role: discord.Option(discord.Role, description="Role required to use the bot. Admins always bypass this."),
 ):
+    if not await _require_guild_admin(ctx):
+        return
     await _set_guild_required_role(ctx.guild_id, str(role.id))
     await ctx.respond(
         f"✓ Bot access restricted to {role.mention} (and admins) in this server.",

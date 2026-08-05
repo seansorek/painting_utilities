@@ -689,6 +689,34 @@ class TestDailyChallengeChannelIdValidation(unittest.IsolatedAsyncioTestCase):
         ctx.defer = AsyncMock()
         ctx.followup = MagicMock()
         ctx.followup.send = AsyncMock()
+
+        # These tests exercise channel_id validation, not the admin gate
+        # added for #79 -- wire up a caller who passes _require_guild_admin
+        # (a resolvable guild member with manage_guild) so that gate is a
+        # no-op here.
+        #
+        # Use bot_module.discord.Member (not _discord_stub.Member) as the
+        # spec: if another test module in the same pytest session imported
+        # the real `discord` package first, sys.modules["discord"] is
+        # already the real one by the time this file's setdefault() call
+        # below runs, so bot_module.discord may end up being the real
+        # package rather than this file's stub. The isinstance() checks in
+        # _require_guild_admin must match whichever one bot.py actually got.
+        admin_member = MagicMock(spec=bot_module.discord.Member)
+        admin_member.id = 1
+        admin_member.guild_permissions = MagicMock()
+        admin_member.guild_permissions.administrator = False
+        admin_member.guild_permissions.manage_guild = True
+
+        guild = MagicMock()
+        guild.id = guild_id
+        guild.get_member.return_value = admin_member
+
+        ctx.guild = guild
+        ctx.author = admin_member
+        ctx.response = MagicMock()
+        ctx.response.is_done.return_value = False
+        ctx.respond = AsyncMock()
         return ctx
 
     async def asyncSetUp(self):
