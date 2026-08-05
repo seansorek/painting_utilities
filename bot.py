@@ -190,6 +190,32 @@ def _is_guild_admin(member: discord.Member) -> bool:
     return p.administrator or p.manage_guild
 
 
+async def _require_guild_admin(ctx: discord.ApplicationContext) -> bool:
+    """Runtime enforcement for admin-only commands.
+
+    ``@discord.default_permissions(manage_guild=True)`` only sets the
+    *default* command-permission UI in Discord — a guild admin can override
+    it to expose the command to any role or member. This checks the caller's
+    live, resolved ``discord.Member`` permissions so the command's real
+    guard does not depend on that overridable default.
+
+    Sends an ephemeral rejection (mirroring the reject-and-explain style
+    used elsewhere in this bot) and returns False when the caller is not a
+    guild admin. Returns True when authorized.
+    """
+    member = ctx.guild.get_member(ctx.author.id) if ctx.guild else None
+    if not isinstance(member, discord.Member):
+        member = ctx.author if isinstance(ctx.author, discord.Member) else None
+    if member is not None and _is_guild_admin(member):
+        return True
+    message = "You need the **Manage Server** permission to use this command."
+    if ctx.response.is_done():
+        await ctx.followup.send(message, ephemeral=True)
+    else:
+        await ctx.respond(message, ephemeral=True)
+    return False
+
+
 @bot.check
 async def _require_bot_role(ctx: discord.ApplicationContext) -> bool:
     if not ctx.guild:
@@ -1720,12 +1746,15 @@ async def _post_scheduled_challenges() -> None:
         schedule = await asyncio.to_thread(_load_schedule)
         due: list[tuple[dict, datetime]] = []
         remaining: list[dict] = []
+        dropped_ids: set[str] = set()
 
         for challenge in schedule:
             try:
                 post_at = datetime.fromisoformat(challenge["post_at"])
             except (KeyError, ValueError, TypeError):
                 print(f"Daily challenge: bad post_at, dropping entry: {challenge!r}")
+                if challenge.get("id"):
+                    dropped_ids.add(challenge["id"])
                 continue
 
             if now >= post_at:
@@ -1736,7 +1765,7 @@ async def _post_scheduled_challenges() -> None:
     # --- Phase 2: send due entries outside the lock (network-bound) ---
     # Collect the IDs of all entries seen in Phase 1 so we can distinguish
     # newly-added entries (by /daily_challenge) from stale ones in Phase 3.
-    phase1_ids: set[str] = {c["id"] for c, _ in due if c.get("id")}
+    phase1_ids: set[str] = {c["id"] for c, _ in due if c.get("id")} | dropped_ids
     remaining_ids: set[str] = {c["id"] for c in remaining if c.get("id")}
 
     # IDs of challenges that failed delivery and should be retried.
