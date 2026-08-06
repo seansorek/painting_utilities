@@ -273,6 +273,62 @@ def _consume_cooldown(user_id: int) -> None:
     _USER_COOLDOWNS[user_id] = now
 
 
+# ---------------------------------------------------------------------------
+# Process-wide admission control for heavy commands
+#
+# _CPU_EXECUTOR has max_workers=1, but a ThreadPoolExecutor's submission queue
+# is unbounded — max_workers only bounds how many closures are *executing* at
+# once, not how many can be queued behind the one worker. Each queued closure
+# retains its attachment bytes (up to MAX_FILE_BYTES, or double that for
+# two-image commands) until the worker reaches it, and later inflates further
+# into decoded images / output buffers. The per-user cooldown does not help
+# here: many different users (or one user across guilds) can still enqueue
+# work faster than the single worker drains it, so process memory is not
+# actually bounded by the per-attachment size limit.
+#
+# _HEAVY_SEMAPHORE caps how many heavy-command invocations may be in flight
+# at once (from admission through executor completion). A slot must be
+# acquired BEFORE any attachment is downloaded, using a short timeout — if
+# none is free almost immediately, we tell the user the bot is busy instead
+# of letting the request queue up. This bounds worst-case in-flight memory to
+# roughly _HEAVY_CONCURRENCY_LIMIT * (2 * MAX_FILE_BYTES), independent of how
+# many requests arrive.
+# ---------------------------------------------------------------------------
+_HEAVY_CONCURRENCY_LIMIT = int(os.getenv("HEAVY_COMMAND_CONCURRENCY", "3"))
+_HEAVY_SLOT_TIMEOUT = 0.1  # seconds — effectively "immediately available or bust"
+_HEAVY_SEMAPHORE = asyncio.Semaphore(_HEAVY_CONCURRENCY_LIMIT)
+
+
+async def _acquire_heavy_slot(ctx: discord.ApplicationContext) -> bool:
+    """Reserve a heavy-command admission slot, or reject the request.
+
+    Must be called BEFORE reading any attachment bytes or doing any other
+    heavy work. Returns True if a slot was acquired — the caller MUST
+    release it exactly once via ``_release_heavy_slot``, in a ``finally``
+    block that covers every exit path (success, validation failure,
+    exception).
+
+    Returns False if the bot is already at capacity. In that case an
+    ephemeral "busy" response has already been sent and the caller must
+    return immediately without reading attachments or submitting any
+    executor work.
+    """
+    try:
+        await asyncio.wait_for(_HEAVY_SEMAPHORE.acquire(), timeout=_HEAVY_SLOT_TIMEOUT)
+    except asyncio.TimeoutError:
+        await ctx.followup.send(
+            "The bot is busy processing other requests right now — please try again in a few seconds.",
+            ephemeral=True,
+        )
+        return False
+    return True
+
+
+def _release_heavy_slot() -> None:
+    """Release a slot acquired via ``_acquire_heavy_slot``."""
+    _HEAVY_SEMAPHORE.release()
+
+
 @bot.event
 async def on_application_command_error(ctx: discord.ApplicationContext, error):
     if isinstance(error, _CooldownError):
@@ -458,53 +514,58 @@ async def analyze(
                                      default=0.0, min_value=-1.0, max_value=1.0, required=False),
 ):
     await ctx.defer()
-    if not await _validate_image(ctx, image):
+    if not await _acquire_heavy_slot(ctx):
         return
-    _consume_cooldown(ctx.author.id)
     try:
-        data = await image.read()
+        if not await _validate_image(ctx, image):
+            return
+        _consume_cooldown(ctx.author.id)
+        try:
+            data = await image.read()
 
-        def _work():
-            cached = _cache_get(data, num_colors, saturation_boost, brightness_boost)
-            if cached:
-                colors, counts, stats = cached
-                img = load_image_from_bytes(data)
-                if saturation_boost != 0.0 or brightness_boost != 0.0:
-                    img = adjust_image(img, saturation_boost, brightness_boost)
-            else:
-                img = load_image_from_bytes(data)
-                if saturation_boost != 0.0 or brightness_boost != 0.0:
-                    img = adjust_image(img, saturation_boost, brightness_boost)
-                colors, counts = extract_dominant_colors(img, n=num_colors)
-                stats = compute_stats(img)
-                _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
-            palette_buf = render_palette_chart(colors, counts)
-            hue_sat_buf = render_hue_saturation_chart(img)
-            return colors, counts, stats, palette_buf, hue_sat_buf
+            def _work():
+                cached = _cache_get(data, num_colors, saturation_boost, brightness_boost)
+                if cached:
+                    colors, counts, stats = cached
+                    img = load_image_from_bytes(data)
+                    if saturation_boost != 0.0 or brightness_boost != 0.0:
+                        img = adjust_image(img, saturation_boost, brightness_boost)
+                else:
+                    img = load_image_from_bytes(data)
+                    if saturation_boost != 0.0 or brightness_boost != 0.0:
+                        img = adjust_image(img, saturation_boost, brightness_boost)
+                    colors, counts = extract_dominant_colors(img, n=num_colors)
+                    stats = compute_stats(img)
+                    _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
+                palette_buf = render_palette_chart(colors, counts)
+                hue_sat_buf = render_hue_saturation_chart(img)
+                return colors, counts, stats, palette_buf, hue_sat_buf
 
-        colors, counts, stats, palette_buf, hue_sat_buf = await _run_cpu(_work)
+            colors, counts, stats, palette_buf, hue_sat_buf = await _run_cpu(_work)
 
-        grayscale_warning = stats["mean_saturation_pct"] < 15
-        embed = _build_stats_embed(stats, colors, counts, image.filename, grayscale_warning, show_rgb, show_cmyk)
+            grayscale_warning = stats["mean_saturation_pct"] < 15
+            embed = _build_stats_embed(stats, colors, counts, image.filename, grayscale_warning, show_rgb, show_cmyk)
 
-        if saturation_boost != 0.0 or brightness_boost != 0.0:
-            adj_note = []
-            if saturation_boost != 0.0:
-                adj_note.append(f"saturation {saturation_boost:+.1f}")
-            if brightness_boost != 0.0:
-                adj_note.append(f"brightness {brightness_boost:+.1f}")
-            embed.set_footer(text=f"Adjusted: {', '.join(adj_note)}")
+            if saturation_boost != 0.0 or brightness_boost != 0.0:
+                adj_note = []
+                if saturation_boost != 0.0:
+                    adj_note.append(f"saturation {saturation_boost:+.1f}")
+                if brightness_boost != 0.0:
+                    adj_note.append(f"brightness {brightness_boost:+.1f}")
+                embed.set_footer(text=f"Adjusted: {', '.join(adj_note)}")
 
-        await ctx.followup.send(
-            embed=embed,
-            files=[
-                discord.File(palette_buf,  filename="palette.png"),
-                discord.File(hue_sat_buf,  filename="hue_sat.png"),
-            ],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong analyzing that image. Make sure it's a valid image file.")
+            await ctx.followup.send(
+                embed=embed,
+                files=[
+                    discord.File(palette_buf,  filename="palette.png"),
+                    discord.File(hue_sat_buf,  filename="hue_sat.png"),
+                ],
+            )
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong analyzing that image. Make sure it's a valid image file.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -525,43 +586,48 @@ async def palette(
                                      default=0.0, min_value=-1.0, max_value=1.0, required=False),
 ):
     await ctx.defer()
-    if not await _validate_image(ctx, image):
+    if not await _acquire_heavy_slot(ctx):
         return
-    _consume_cooldown(ctx.author.id)
     try:
-        data = await image.read()
+        if not await _validate_image(ctx, image):
+            return
+        _consume_cooldown(ctx.author.id)
+        try:
+            data = await image.read()
 
-        def _work():
-            cached = _cache_get(data, num_colors, saturation_boost, brightness_boost)
-            if cached:
-                colors, counts, _ = cached
-            else:
-                img = load_image_from_bytes(data)
-                if saturation_boost != 0.0 or brightness_boost != 0.0:
-                    img = adjust_image(img, saturation_boost, brightness_boost)
-                colors, counts = extract_dominant_colors(img, n=num_colors)
-                stats = compute_stats(img)
-                _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
-            palette_buf = render_palette_chart(colors, counts)
-            return colors, counts, palette_buf
+            def _work():
+                cached = _cache_get(data, num_colors, saturation_boost, brightness_boost)
+                if cached:
+                    colors, counts, _ = cached
+                else:
+                    img = load_image_from_bytes(data)
+                    if saturation_boost != 0.0 or brightness_boost != 0.0:
+                        img = adjust_image(img, saturation_boost, brightness_boost)
+                    colors, counts = extract_dominant_colors(img, n=num_colors)
+                    stats = compute_stats(img)
+                    _cache_set(data, num_colors, saturation_boost, brightness_boost, colors, counts, stats)
+                palette_buf = render_palette_chart(colors, counts)
+                return colors, counts, palette_buf
 
-        colors, counts, palette_buf = await _run_cpu(_work)
-        total = counts.sum()
-        lines = [_color_line(rgb, cnt, total, show_rgb, show_cmyk) for rgb, cnt in zip(colors, counts)]
-        embed = discord.Embed(
-            title=f"Color Palette — {image.filename}",
-            description="\n".join(lines),
-            color=discord.Color.from_rgb(int(colors[0][0]), int(colors[0][1]), int(colors[0][2])),
-        )
-        embed.set_image(url="attachment://palette.png")
+            colors, counts, palette_buf = await _run_cpu(_work)
+            total = counts.sum()
+            lines = [_color_line(rgb, cnt, total, show_rgb, show_cmyk) for rgb, cnt in zip(colors, counts)]
+            embed = discord.Embed(
+                title=f"Color Palette — {image.filename}",
+                description="\n".join(lines),
+                color=discord.Color.from_rgb(int(colors[0][0]), int(colors[0][1]), int(colors[0][2])),
+            )
+            embed.set_image(url="attachment://palette.png")
 
-        await ctx.followup.send(
-            embed=embed,
-            files=[discord.File(palette_buf, filename="palette.png")],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong. Make sure it's a valid image file.")
+            await ctx.followup.send(
+                embed=embed,
+                files=[discord.File(palette_buf, filename="palette.png")],
+            )
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong. Make sure it's a valid image file.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -585,66 +651,71 @@ async def gradient_map_cmd(
     reverse: discord.Option(bool, description="Flip the gradient direction", default=False, required=False),
 ):
     await ctx.defer()
-    if not await _validate_image(ctx, image):
+    if not await _acquire_heavy_slot(ctx):
         return
-    _consume_cooldown(ctx.author.id)
-
-    # Resolve gradient stops
-    gradient_stops = None
-    gradient_label = preset
-
-    if custom_colors is not None:
-        try:
-            gradient_stops = parse_multi_hex_gradient(custom_colors)
-            hex_labels = " → ".join(p.strip().upper() for p in custom_colors.split(",") if p.strip())
-            gradient_label = f"custom ({hex_labels})"
-        except ValueError as e:
-            await ctx.followup.send(str(e))
-            return
-    elif start_color is not None or end_color is not None:
-        if (start_color is None) != (end_color is None):
-            await ctx.followup.send("Provide both `start_color` and `end_color`, or neither.")
-            return
-        try:
-            r0, g0, b0 = parse_hex_color(start_color)
-            r1, g1, b1 = parse_hex_color(end_color)
-        except ValueError as e:
-            await ctx.followup.send(str(e))
-            return
-        gradient_stops = [(0.0, r0, g0, b0), (1.0, r1, g1, b1)]
-        gradient_label = f"custom ({start_color.upper()} → {end_color.upper()})"
-    else:
-        gradient_stops = GRADIENT_PRESETS[preset]
-
-    if reverse:
-        gradient_stops = reverse_gradient(gradient_stops)
-        gradient_label += " (reversed)"
-
     try:
-        data = await image.read()
+        if not await _validate_image(ctx, image):
+            return
+        _consume_cooldown(ctx.author.id)
 
-        def _work():
-            img = load_image_from_bytes(data)
-            result = apply_gradient_map(img, gradient_stops)
-            out_buf = io.BytesIO()
-            result.save(out_buf, format="PNG")
-            out_buf.seek(0)
-            swatch_buf = render_gradient_preview(gradient_stops)
-            return img, out_buf, swatch_buf
+        # Resolve gradient stops
+        gradient_stops = None
+        gradient_label = preset
 
-        img, out_buf, swatch_buf = await _run_cpu(_work)
-        embed = _build_gradient_embed(image.filename, gradient_label, img, gradient_stops)
+        if custom_colors is not None:
+            try:
+                gradient_stops = parse_multi_hex_gradient(custom_colors)
+                hex_labels = " → ".join(p.strip().upper() for p in custom_colors.split(",") if p.strip())
+                gradient_label = f"custom ({hex_labels})"
+            except ValueError as e:
+                await ctx.followup.send(str(e))
+                return
+        elif start_color is not None or end_color is not None:
+            if (start_color is None) != (end_color is None):
+                await ctx.followup.send("Provide both `start_color` and `end_color`, or neither.")
+                return
+            try:
+                r0, g0, b0 = parse_hex_color(start_color)
+                r1, g1, b1 = parse_hex_color(end_color)
+            except ValueError as e:
+                await ctx.followup.send(str(e))
+                return
+            gradient_stops = [(0.0, r0, g0, b0), (1.0, r1, g1, b1)]
+            gradient_label = f"custom ({start_color.upper()} → {end_color.upper()})"
+        else:
+            gradient_stops = GRADIENT_PRESETS[preset]
 
-        await ctx.followup.send(
-            embed=embed,
-            files=[
-                discord.File(out_buf,    filename="gradient_map.png"),
-                discord.File(swatch_buf, filename="gradient_swatch.png"),
-            ],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong processing the image.")
+        if reverse:
+            gradient_stops = reverse_gradient(gradient_stops)
+            gradient_label += " (reversed)"
+
+        try:
+            data = await image.read()
+
+            def _work():
+                img = load_image_from_bytes(data)
+                result = apply_gradient_map(img, gradient_stops)
+                out_buf = io.BytesIO()
+                result.save(out_buf, format="PNG")
+                out_buf.seek(0)
+                swatch_buf = render_gradient_preview(gradient_stops)
+                return img, out_buf, swatch_buf
+
+            img, out_buf, swatch_buf = await _run_cpu(_work)
+            embed = _build_gradient_embed(image.filename, gradient_label, img, gradient_stops)
+
+            await ctx.followup.send(
+                embed=embed,
+                files=[
+                    discord.File(out_buf,    filename="gradient_map.png"),
+                    discord.File(swatch_buf, filename="gradient_swatch.png"),
+                ],
+            )
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong processing the image.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -664,48 +735,53 @@ async def palette_gradient_cmd(
     reverse: discord.Option(bool, description="Flip the gradient direction", default=False, required=False),
 ):
     await ctx.defer()
-    if not await _validate_image(ctx, image):
+    if not await _acquire_heavy_slot(ctx):
         return
-    _consume_cooldown(ctx.author.id)
     try:
-        data = await image.read()
+        if not await _validate_image(ctx, image):
+            return
+        _consume_cooldown(ctx.author.id)
+        try:
+            data = await image.read()
 
-        def _work():
-            img = load_image_from_bytes(data)
-            colors, counts = extract_dominant_colors(img, n=num_colors)
-            gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
-            if reverse:
-                gradient_stops = reverse_gradient(gradient_stops)
-            result = apply_gradient_map(img, gradient_stops)
-            out_buf = io.BytesIO()
-            result.save(out_buf, format="PNG")
-            out_buf.seek(0)
-            swatch_buf = render_gradient_preview(gradient_stops)
-            return colors, gradient_stops, img, out_buf, swatch_buf
+            def _work():
+                img = load_image_from_bytes(data)
+                colors, counts = extract_dominant_colors(img, n=num_colors)
+                gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
+                if reverse:
+                    gradient_stops = reverse_gradient(gradient_stops)
+                result = apply_gradient_map(img, gradient_stops)
+                out_buf = io.BytesIO()
+                result.save(out_buf, format="PNG")
+                out_buf.seek(0)
+                swatch_buf = render_gradient_preview(gradient_stops)
+                return colors, gradient_stops, img, out_buf, swatch_buf
 
-        colors, gradient_stops, img, out_buf, swatch_buf = await _run_cpu(_work)
-        stop_colors = " → ".join(f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in sorted(gradient_stops))
-        embed = discord.Embed(
-            title=f"Palette Gradient — {image.filename}",
-            color=discord.Color.from_rgb(*[int(v) for v in colors[0]]),
-        )
-        embed.add_field(name="Gradient",    value=stop_colors,                       inline=False)
-        embed.add_field(name="Sorted by",   value=sort_by.capitalize(),              inline=True)
-        embed.add_field(name="Reversed",    value="Yes" if reverse else "No",        inline=True)
-        embed.add_field(name="Dimensions",  value=f"{img.width} × {img.height} px", inline=True)
-        embed.set_image(url="attachment://gradient_map.png")
-        embed.set_thumbnail(url="attachment://gradient_swatch.png")
+            colors, gradient_stops, img, out_buf, swatch_buf = await _run_cpu(_work)
+            stop_colors = " → ".join(f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in sorted(gradient_stops))
+            embed = discord.Embed(
+                title=f"Palette Gradient — {image.filename}",
+                color=discord.Color.from_rgb(*[int(v) for v in colors[0]]),
+            )
+            embed.add_field(name="Gradient",    value=stop_colors,                       inline=False)
+            embed.add_field(name="Sorted by",   value=sort_by.capitalize(),              inline=True)
+            embed.add_field(name="Reversed",    value="Yes" if reverse else "No",        inline=True)
+            embed.add_field(name="Dimensions",  value=f"{img.width} × {img.height} px", inline=True)
+            embed.set_image(url="attachment://gradient_map.png")
+            embed.set_thumbnail(url="attachment://gradient_swatch.png")
 
-        await ctx.followup.send(
-            embed=embed,
-            files=[
-                discord.File(out_buf,    filename="gradient_map.png"),
-                discord.File(swatch_buf, filename="gradient_swatch.png"),
-            ],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong processing the image.")
+            await ctx.followup.send(
+                embed=embed,
+                files=[
+                    discord.File(out_buf,    filename="gradient_map.png"),
+                    discord.File(swatch_buf, filename="gradient_swatch.png"),
+                ],
+            )
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong processing the image.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -740,51 +816,56 @@ async def export_palette_cmd(
                                  default="Palette", required=False),
 ):
     await ctx.defer()
-    if not await _validate_image(ctx, image):
+    if not await _acquire_heavy_slot(ctx):
         return
-    _consume_cooldown(ctx.author.id)
     try:
-        data = await image.read()
+        if not await _validate_image(ctx, image):
+            return
+        _consume_cooldown(ctx.author.id)
+        try:
+            data = await image.read()
 
-        def _work():
-            img = load_image_from_bytes(data)
-            colors, counts = extract_dominant_colors(img, n=num_colors)
-            color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
-            safe_palette_name = _sanitize_filename_component(palette_name)
-            format_map = {
-                "ase":      (export_ase,      "palette.ase"),
-                "swatches": (export_swatches, "palette.swatches"),
-                "gpl":      (export_gpl,      f"{safe_palette_name}.gpl"),
-                "aco":      (export_aco,      "palette.aco"),
-                "css":      (export_css,      "palette.css"),
-                "tailwind": (export_tailwind, "palette.json"),
-            }
-            fn, filename = format_map[format]
-            file_bytes = fn(color_list, palette_name)
-            return colors, counts, color_list, file_bytes, filename
+            def _work():
+                img = load_image_from_bytes(data)
+                colors, counts = extract_dominant_colors(img, n=num_colors)
+                color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
+                safe_palette_name = _sanitize_filename_component(palette_name)
+                format_map = {
+                    "ase":      (export_ase,      "palette.ase"),
+                    "swatches": (export_swatches, "palette.swatches"),
+                    "gpl":      (export_gpl,      f"{safe_palette_name}.gpl"),
+                    "aco":      (export_aco,      "palette.aco"),
+                    "css":      (export_css,      "palette.css"),
+                    "tailwind": (export_tailwind, "palette.json"),
+                }
+                fn, filename = format_map[format]
+                file_bytes = fn(color_list, palette_name)
+                return colors, counts, color_list, file_bytes, filename
 
-        colors, counts, color_list, file_bytes, filename = await _run_cpu(_work)
+            colors, counts, color_list, file_bytes, filename = await _run_cpu(_work)
 
-        total = counts.sum()
-        lines = [
-            f"`#{r:02X}{g:02X}{b:02X}` {_pct_bar(cnt/total*100)} **{nearest_color_name((r,g,b))}** {cnt/total*100:.1f}%"
-            for (r, g, b), cnt in zip(color_list, counts)
-        ]
-        embed = discord.Embed(
-            title=f"Palette Export — {image.filename}",
-            description="\n".join(lines),
-            color=discord.Color.from_rgb(*color_list[0]),
-        )
-        embed.add_field(name="Format", value=f".{format}", inline=True)
-        embed.add_field(name="Colors", value=str(num_colors), inline=True)
+            total = counts.sum()
+            lines = [
+                f"`#{r:02X}{g:02X}{b:02X}` {_pct_bar(cnt/total*100)} **{nearest_color_name((r,g,b))}** {cnt/total*100:.1f}%"
+                for (r, g, b), cnt in zip(color_list, counts)
+            ]
+            embed = discord.Embed(
+                title=f"Palette Export — {image.filename}",
+                description="\n".join(lines),
+                color=discord.Color.from_rgb(*color_list[0]),
+            )
+            embed.add_field(name="Format", value=f".{format}", inline=True)
+            embed.add_field(name="Colors", value=str(num_colors), inline=True)
 
-        await ctx.followup.send(
-            embed=embed,
-            files=[discord.File(io.BytesIO(file_bytes), filename=filename)],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong exporting the palette.")
+            await ctx.followup.send(
+                embed=embed,
+                files=[discord.File(io.BytesIO(file_bytes), filename=filename)],
+            )
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong exporting the palette.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -808,49 +889,54 @@ async def export_gradient_cmd(
     reverse: discord.Option(bool, description="Flip the gradient direction", default=False, required=False),
 ):
     await ctx.defer()
-    if not await _validate_image(ctx, image):
+    if not await _acquire_heavy_slot(ctx):
         return
-    _consume_cooldown(ctx.author.id)
     try:
-        data = await image.read()
+        if not await _validate_image(ctx, image):
+            return
+        _consume_cooldown(ctx.author.id)
+        try:
+            data = await image.read()
 
-        def _work():
-            img = load_image_from_bytes(data)
-            colors, counts = extract_dominant_colors(img, n=num_colors)
-            gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
-            if reverse:
-                gradient_stops = reverse_gradient(gradient_stops)
-            swatch_buf = render_gradient_preview(gradient_stops)
-            if format == "ggr":
-                file_bytes = export_gradient_ggr(gradient_stops, name=gradient_name)
-                filename = f"{gradient_name}.ggr"
-            else:
-                file_bytes = export_gradient_json(gradient_stops, name=gradient_name)
-                filename = f"{gradient_name}.json"
-            return colors, gradient_stops, swatch_buf, file_bytes, filename
+            def _work():
+                img = load_image_from_bytes(data)
+                colors, counts = extract_dominant_colors(img, n=num_colors)
+                gradient_stops = palette_to_gradient_stops(colors, counts, sort_by=sort_by)
+                if reverse:
+                    gradient_stops = reverse_gradient(gradient_stops)
+                swatch_buf = render_gradient_preview(gradient_stops)
+                if format == "ggr":
+                    file_bytes = export_gradient_ggr(gradient_stops, name=gradient_name)
+                    filename = f"{gradient_name}.ggr"
+                else:
+                    file_bytes = export_gradient_json(gradient_stops, name=gradient_name)
+                    filename = f"{gradient_name}.json"
+                return colors, gradient_stops, swatch_buf, file_bytes, filename
 
-        colors, gradient_stops, swatch_buf, file_bytes, filename = await _run_cpu(_work)
-        stop_colors = " → ".join(f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in sorted(gradient_stops))
-        embed = discord.Embed(
-            title=f"Gradient Export — {image.filename}",
-            color=discord.Color.from_rgb(*[int(v) for v in colors[0]]),
-        )
-        embed.add_field(name="Gradient",   value=stop_colors,              inline=False)
-        embed.add_field(name="Format",     value=f".{format}",             inline=True)
-        embed.add_field(name="Sorted by",  value=sort_by.capitalize(),     inline=True)
-        embed.add_field(name="Colors",     value=str(num_colors),          inline=True)
-        embed.set_image(url="attachment://gradient_swatch.png")
+            colors, gradient_stops, swatch_buf, file_bytes, filename = await _run_cpu(_work)
+            stop_colors = " → ".join(f"#{r:02X}{g:02X}{b:02X}" for _, r, g, b in sorted(gradient_stops))
+            embed = discord.Embed(
+                title=f"Gradient Export — {image.filename}",
+                color=discord.Color.from_rgb(*[int(v) for v in colors[0]]),
+            )
+            embed.add_field(name="Gradient",   value=stop_colors,              inline=False)
+            embed.add_field(name="Format",     value=f".{format}",             inline=True)
+            embed.add_field(name="Sorted by",  value=sort_by.capitalize(),     inline=True)
+            embed.add_field(name="Colors",     value=str(num_colors),          inline=True)
+            embed.set_image(url="attachment://gradient_swatch.png")
 
-        await ctx.followup.send(
-            embed=embed,
-            files=[
-                discord.File(io.BytesIO(file_bytes), filename=filename),
-                discord.File(swatch_buf, filename="gradient_swatch.png"),
-            ],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong exporting the gradient.")
+            await ctx.followup.send(
+                embed=embed,
+                files=[
+                    discord.File(io.BytesIO(file_bytes), filename=filename),
+                    discord.File(swatch_buf, filename="gradient_swatch.png"),
+                ],
+            )
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong exporting the gradient.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -865,68 +951,73 @@ async def color_info_cmd(
     hex_color: discord.Option(str, description="Hex color code, e.g. #3a7bd5 or 3a7bd5"),
 ):
     await ctx.defer()
-    try:
-        r, g, b = parse_hex_color(hex_color)
-    except ValueError as e:
-        await ctx.followup.send(str(e))
+    if not await _acquire_heavy_slot(ctx):
         return
-    _consume_cooldown(ctx.author.id)
-
     try:
-        hex_str = f"#{r:02X}{g:02X}{b:02X}"
-        name = nearest_color_name((r, g, b))
-        c, m, y, k = rgb_to_cmyk(r, g, b)
-        h_f, s_f, v_f = __import__("colorsys").rgb_to_hsv(r / 255, g / 255, b / 255)
-        h_deg = round(h_f * 360)
-        s_pct = round(s_f * 100)
-        v_pct = round(v_f * 100)
-        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        try:
+            r, g, b = parse_hex_color(hex_color)
+        except ValueError as e:
+            await ctx.followup.send(str(e))
+            return
+        _consume_cooldown(ctx.author.id)
 
-        brightness_label = "Dark" if lum < 64 else "Medium-Dark" if lum < 128 else "Medium-Light" if lum < 192 else "Light"
-        # Temperature: warm = reds/oranges/yellows (h < 60° or h > 300°), cool = blues/greens
-        warm = h_deg < 60 or h_deg > 300
-        temp_label = "Warm" if warm else ("Neutral" if 60 <= h_deg <= 80 or 160 <= h_deg <= 200 else "Cool")
+        try:
+            hex_str = f"#{r:02X}{g:02X}{b:02X}"
+            name = nearest_color_name((r, g, b))
+            c, m, y, k = rgb_to_cmyk(r, g, b)
+            h_f, s_f, v_f = __import__("colorsys").rgb_to_hsv(r / 255, g / 255, b / 255)
+            h_deg = round(h_f * 360)
+            s_pct = round(s_f * 100)
+            v_pct = round(v_f * 100)
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
 
-        # Harmony suggestions
-        import colorsys as _cs
+            brightness_label = "Dark" if lum < 64 else "Medium-Dark" if lum < 128 else "Medium-Light" if lum < 192 else "Light"
+            # Temperature: warm = reds/oranges/yellows (h < 60° or h > 300°), cool = blues/greens
+            warm = h_deg < 60 or h_deg > 300
+            temp_label = "Warm" if warm else ("Neutral" if 60 <= h_deg <= 80 or 160 <= h_deg <= 200 else "Cool")
 
-        def _hue_rgb(target_h):
-            rr, gg, bb = _cs.hsv_to_rgb(target_h % 1.0, max(s_f, 0.65), max(v_f, 0.6))
-            return (int(rr * 255), int(gg * 255), int(bb * 255))
+            # Harmony suggestions
+            import colorsys as _cs
 
-        harmonies = [
-            (_hue_rgb(h_f + 0.5),    "Complement"),
-            (_hue_rgb(h_f + 1 / 3),  "Triadic A"),
-            (_hue_rgb(h_f + 2 / 3),  "Triadic B"),
-            (_hue_rgb(h_f + 1 / 12), "Analogous +30°"),
-            (_hue_rgb(h_f - 1 / 12), "Analogous -30°"),
-        ]
+            def _hue_rgb(target_h):
+                rr, gg, bb = _cs.hsv_to_rgb(target_h % 1.0, max(s_f, 0.65), max(v_f, 0.6))
+                return (int(rr * 255), int(gg * 255), int(bb * 255))
 
-        swatch_buf = await _run_cpu(render_color_info_swatch, (r, g, b), harmonies)
+            harmonies = [
+                (_hue_rgb(h_f + 0.5),    "Complement"),
+                (_hue_rgb(h_f + 1 / 3),  "Triadic A"),
+                (_hue_rgb(h_f + 2 / 3),  "Triadic B"),
+                (_hue_rgb(h_f + 1 / 12), "Analogous +30°"),
+                (_hue_rgb(h_f - 1 / 12), "Analogous -30°"),
+            ]
 
-        embed = discord.Embed(
-            title=f"Color Info — {hex_str}",
-            color=discord.Color.from_rgb(r, g, b),
-        )
-        embed.add_field(name="Name",        value=name,                                    inline=True)
-        embed.add_field(name="Brightness",  value=brightness_label,                        inline=True)
-        embed.add_field(name="Temperature", value=temp_label,                              inline=True)
-        embed.add_field(name="RGB",         value=f"R {r}, G {g}, B {b}",                 inline=True)
-        embed.add_field(name="HSV",         value=f"H {h_deg}°, S {s_pct}%, V {v_pct}%", inline=True)
-        embed.add_field(name="CMYK",        value=f"C {c}%, M {m}%, Y {y}%, K {k}%",     inline=True)
-        harmony_text = "\n".join(
-            f"`#{rh:02X}{gh:02X}{bh:02X}` {lbl}" for (rh, gh, bh), lbl in harmonies
-        )
-        embed.add_field(name="Harmony Suggestions", value=harmony_text, inline=False)
-        embed.set_image(url="attachment://color_info.png")
+            swatch_buf = await _run_cpu(render_color_info_swatch, (r, g, b), harmonies)
 
-        await ctx.followup.send(
-            embed=embed,
-            files=[discord.File(swatch_buf, filename="color_info.png")],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong processing that color.")
+            embed = discord.Embed(
+                title=f"Color Info — {hex_str}",
+                color=discord.Color.from_rgb(r, g, b),
+            )
+            embed.add_field(name="Name",        value=name,                                    inline=True)
+            embed.add_field(name="Brightness",  value=brightness_label,                        inline=True)
+            embed.add_field(name="Temperature", value=temp_label,                              inline=True)
+            embed.add_field(name="RGB",         value=f"R {r}, G {g}, B {b}",                 inline=True)
+            embed.add_field(name="HSV",         value=f"H {h_deg}°, S {s_pct}%, V {v_pct}%", inline=True)
+            embed.add_field(name="CMYK",        value=f"C {c}%, M {m}%, Y {y}%, K {k}%",     inline=True)
+            harmony_text = "\n".join(
+                f"`#{rh:02X}{gh:02X}{bh:02X}` {lbl}" for (rh, gh, bh), lbl in harmonies
+            )
+            embed.add_field(name="Harmony Suggestions", value=harmony_text, inline=False)
+            embed.set_image(url="attachment://color_info.png")
+
+            await ctx.followup.send(
+                embed=embed,
+                files=[discord.File(swatch_buf, filename="color_info.png")],
+            )
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong processing that color.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -944,63 +1035,68 @@ async def compare_cmd(
                                default=8, min_value=3, max_value=16),
 ):
     await ctx.defer()
-    for att in (image_a, image_b):
-        reason = _image_rejection_reason(att)
-        if reason:
-            await ctx.followup.send(reason)
-            return
-    _consume_cooldown(ctx.author.id)
-
+    if not await _acquire_heavy_slot(ctx):
+        return
     try:
-        data_a = await image_a.read()
-        data_b = await image_b.read()
+        for att in (image_a, image_b):
+            reason = _image_rejection_reason(att)
+            if reason:
+                await ctx.followup.send(reason)
+                return
+        _consume_cooldown(ctx.author.id)
 
-        def _get_colors(data):
-            cached = _cache_get(data, num_colors)
-            if cached:
-                colors, counts, _ = cached
+        try:
+            data_a = await image_a.read()
+            data_b = await image_b.read()
+
+            def _get_colors(data):
+                cached = _cache_get(data, num_colors)
+                if cached:
+                    colors, counts, _ = cached
+                    return colors, counts
+                img = load_image_from_bytes(data)
+                colors, counts = extract_dominant_colors(img, n=num_colors)
+                stats = compute_stats(img)
+                _cache_set(data, num_colors, 0.0, 0.0, colors, counts, stats)
                 return colors, counts
-            img = load_image_from_bytes(data)
-            colors, counts = extract_dominant_colors(img, n=num_colors)
-            stats = compute_stats(img)
-            _cache_set(data, num_colors, 0.0, 0.0, colors, counts, stats)
-            return colors, counts
 
-        def _work():
-            colors_a, counts_a = _get_colors(data_a)
-            colors_b, counts_b = _get_colors(data_b)
-            compare_buf = render_compare_chart(
-                colors_a, counts_a, image_a.filename,
-                colors_b, counts_b, image_b.filename,
+            def _work():
+                colors_a, counts_a = _get_colors(data_a)
+                colors_b, counts_b = _get_colors(data_b)
+                compare_buf = render_compare_chart(
+                    colors_a, counts_a, image_a.filename,
+                    colors_b, counts_b, image_b.filename,
+                )
+                return colors_a, counts_a, colors_b, counts_b, compare_buf
+
+            colors_a, counts_a, colors_b, counts_b, compare_buf = await _run_cpu(_work)
+            total_a, total_b = counts_a.sum(), counts_b.sum()
+
+            def _top_hex(colors, counts, total):
+                return "  ".join(
+                    f"`#{int(c[0]):02X}{int(c[1]):02X}{int(c[2]):02X}` {cnt/total*100:.0f}%"
+                    for c, cnt in zip(colors[:4], counts[:4])
+                )
+
+            embed = discord.Embed(
+                title="Palette Comparison",
+                color=discord.Color.from_rgb(int(colors_a[0][0]), int(colors_a[0][1]), int(colors_a[0][2])),
             )
-            return colors_a, counts_a, colors_b, counts_b, compare_buf
+            embed.add_field(name=f"🖼 {image_a.filename}", value=_top_hex(colors_a, counts_a, total_a), inline=False)
+            embed.add_field(name=f"🖼 {image_b.filename}", value=_top_hex(colors_b, counts_b, total_b), inline=False)
+            embed.add_field(name="Palette Type A", value=classify_palette_type(colors_a, counts_a), inline=True)
+            embed.add_field(name="Palette Type B", value=classify_palette_type(colors_b, counts_b), inline=True)
+            embed.set_image(url="attachment://compare.png")
 
-        colors_a, counts_a, colors_b, counts_b, compare_buf = await _run_cpu(_work)
-        total_a, total_b = counts_a.sum(), counts_b.sum()
-
-        def _top_hex(colors, counts, total):
-            return "  ".join(
-                f"`#{int(c[0]):02X}{int(c[1]):02X}{int(c[2]):02X}` {cnt/total*100:.0f}%"
-                for c, cnt in zip(colors[:4], counts[:4])
+            await ctx.followup.send(
+                embed=embed,
+                files=[discord.File(compare_buf, filename="compare.png")],
             )
-
-        embed = discord.Embed(
-            title="Palette Comparison",
-            color=discord.Color.from_rgb(int(colors_a[0][0]), int(colors_a[0][1]), int(colors_a[0][2])),
-        )
-        embed.add_field(name=f"🖼 {image_a.filename}", value=_top_hex(colors_a, counts_a, total_a), inline=False)
-        embed.add_field(name=f"🖼 {image_b.filename}", value=_top_hex(colors_b, counts_b, total_b), inline=False)
-        embed.add_field(name="Palette Type A", value=classify_palette_type(colors_a, counts_a), inline=True)
-        embed.add_field(name="Palette Type B", value=classify_palette_type(colors_b, counts_b), inline=True)
-        embed.set_image(url="attachment://compare.png")
-
-        await ctx.followup.send(
-            embed=embed,
-            files=[discord.File(compare_buf, filename="compare.png")],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong comparing the images.")
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong comparing the images.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -1018,52 +1114,57 @@ async def colorblind_cmd(
                          default="all", required=False),
 ):
     await ctx.defer()
-    if not await _validate_image(ctx, image):
+    if not await _acquire_heavy_slot(ctx):
         return
-    _consume_cooldown(ctx.author.id)
     try:
-        data = await image.read()
+        if not await _validate_image(ctx, image):
+            return
+        _consume_cooldown(ctx.author.id)
+        try:
+            data = await image.read()
 
-        type_labels = {
-            "deuteranopia": "Deuteranopia (red-green, missing green)",
-            "protanopia":   "Protanopia (red-green, missing red)",
-            "tritanopia":   "Tritanopia (blue-yellow, missing blue)",
-        }
+            type_labels = {
+                "deuteranopia": "Deuteranopia (red-green, missing green)",
+                "protanopia":   "Protanopia (red-green, missing red)",
+                "tritanopia":   "Tritanopia (blue-yellow, missing blue)",
+            }
 
-        def _work():
-            img = load_image_from_bytes(data)
+            def _work():
+                img = load_image_from_bytes(data)
+                if type == "all":
+                    return img, render_colorblind_comparison(img)
+                sim = simulate_colorblindness(img, type)
+                buf = io.BytesIO()
+                sim.save(buf, format="PNG")
+                buf.seek(0)
+                return img, buf
+
+            img, result_buf = await _run_cpu(_work)
+
             if type == "all":
-                return img, render_colorblind_comparison(img)
-            sim = simulate_colorblindness(img, type)
-            buf = io.BytesIO()
-            sim.save(buf, format="PNG")
-            buf.seek(0)
-            return img, buf
+                filename = "colorblind_all.png"
+                type_label = "All types (4-panel comparison)"
+            else:
+                filename = f"colorblind_{type}.png"
+                type_label = type_labels[type]
 
-        img, result_buf = await _run_cpu(_work)
+            embed = discord.Embed(
+                title=f"Color Blindness Simulation — {image.filename}",
+                color=discord.Color.from_rgb(100, 149, 237),  # cornflower blue — neutral
+            )
+            embed.add_field(name="Type",       value=type_label,                          inline=False)
+            embed.add_field(name="Dimensions", value=f"{img.width} × {img.height} px",   inline=True)
+            embed.set_image(url=f"attachment://{filename}")
 
-        if type == "all":
-            filename = "colorblind_all.png"
-            type_label = "All types (4-panel comparison)"
-        else:
-            filename = f"colorblind_{type}.png"
-            type_label = type_labels[type]
-
-        embed = discord.Embed(
-            title=f"Color Blindness Simulation — {image.filename}",
-            color=discord.Color.from_rgb(100, 149, 237),  # cornflower blue — neutral
-        )
-        embed.add_field(name="Type",       value=type_label,                          inline=False)
-        embed.add_field(name="Dimensions", value=f"{img.width} × {img.height} px",   inline=True)
-        embed.set_image(url=f"attachment://{filename}")
-
-        await ctx.followup.send(
-            embed=embed,
-            files=[discord.File(result_buf, filename=filename)],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong simulating color blindness.")
+            await ctx.followup.send(
+                embed=embed,
+                files=[discord.File(result_buf, filename=filename)],
+            )
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong simulating color blindness.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -1081,58 +1182,63 @@ async def recolor_cmd(
                                default=8, min_value=3, max_value=16),
 ):
     await ctx.defer()
-    for att in (source, target):
-        reason = _image_rejection_reason(att)
-        if reason:
-            await ctx.followup.send(reason)
-            return
-    _consume_cooldown(ctx.author.id)
-
+    if not await _acquire_heavy_slot(ctx):
+        return
     try:
-        src_data = await source.read()
-        tgt_data = await target.read()
+        for att in (source, target):
+            reason = _image_rejection_reason(att)
+            if reason:
+                await ctx.followup.send(reason)
+                return
+        _consume_cooldown(ctx.author.id)
 
-        def _work():
-            cached = _cache_get(src_data, num_colors)
-            if cached:
-                colors, _counts, _ = cached
-            else:
-                src_img = load_image_from_bytes(src_data)
-                colors, _counts = extract_dominant_colors(src_img, n=num_colors)
-                _stats = compute_stats(src_img)
-                _cache_set(src_data, num_colors, 0.0, 0.0, colors, _counts, _stats)
-            tgt_img = load_image_from_bytes(tgt_data)
-            color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
-            result = recolor_image(tgt_img, color_list)
-            out_buf = io.BytesIO()
-            result.save(out_buf, format="PNG")
-            out_buf.seek(0)
-            return color_list, out_buf, result.width, result.height
+        try:
+            src_data = await source.read()
+            tgt_data = await target.read()
 
-        color_list, out_buf, result_w, result_h = await _run_cpu(_work)
+            def _work():
+                cached = _cache_get(src_data, num_colors)
+                if cached:
+                    colors, _counts, _ = cached
+                else:
+                    src_img = load_image_from_bytes(src_data)
+                    colors, _counts = extract_dominant_colors(src_img, n=num_colors)
+                    _stats = compute_stats(src_img)
+                    _cache_set(src_data, num_colors, 0.0, 0.0, colors, _counts, _stats)
+                tgt_img = load_image_from_bytes(tgt_data)
+                color_list = [(int(c[0]), int(c[1]), int(c[2])) for c in colors]
+                result = recolor_image(tgt_img, color_list)
+                out_buf = io.BytesIO()
+                result.save(out_buf, format="PNG")
+                out_buf.seek(0)
+                return color_list, out_buf, result.width, result.height
 
-        palette_lines = "  ".join(
-            f"`#{r:02X}{g:02X}{b:02X}`" for r, g, b in color_list[:8]
-        )
+            color_list, out_buf, result_w, result_h = await _run_cpu(_work)
 
-        embed = discord.Embed(
-            title=f"Recolor — {target.filename}",
-            color=discord.Color.from_rgb(*color_list[0]),
-        )
-        embed.add_field(name="Source Palette",
-                        value=f"From **{source.filename}** ({num_colors} colors)\n{palette_lines}",
-                        inline=False)
-        embed.add_field(name="Output Size",
-                        value=f"{result_w} × {result_h} px", inline=True)
-        embed.set_image(url="attachment://recolor.png")
+            palette_lines = "  ".join(
+                f"`#{r:02X}{g:02X}{b:02X}`" for r, g, b in color_list[:8]
+            )
 
-        await ctx.followup.send(
-            embed=embed,
-            files=[discord.File(out_buf, filename="recolor.png")],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong recoloring the image.")
+            embed = discord.Embed(
+                title=f"Recolor — {target.filename}",
+                color=discord.Color.from_rgb(*color_list[0]),
+            )
+            embed.add_field(name="Source Palette",
+                            value=f"From **{source.filename}** ({num_colors} colors)\n{palette_lines}",
+                            inline=False)
+            embed.add_field(name="Output Size",
+                            value=f"{result_w} × {result_h} px", inline=True)
+            embed.set_image(url="attachment://recolor.png")
+
+            await ctx.followup.send(
+                embed=embed,
+                files=[discord.File(out_buf, filename="recolor.png")],
+            )
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong recoloring the image.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
@@ -1149,50 +1255,55 @@ async def suggest_harmony_cmd(
                                default=8, min_value=3, max_value=16),
 ):
     await ctx.defer()
-    if not await _validate_image(ctx, image):
+    if not await _acquire_heavy_slot(ctx):
         return
-    _consume_cooldown(ctx.author.id)
     try:
-        data = await image.read()
-
-        def _work():
-            img = load_image_from_bytes(data)
-            colors, counts = extract_dominant_colors(img, n=num_colors)
-            palette_type, suggestions = suggest_harmony_colors(colors, counts)
-            if not suggestions:
-                return palette_type, suggestions, None, None
-            orig_list = [tuple(int(v) for v in c) for c in colors]
-            harmony_buf = render_harmony_chart(orig_list, suggestions)
-            return palette_type, suggestions, orig_list, harmony_buf
-
-        palette_type, suggestions, orig_list, harmony_buf = await _run_cpu(_work)
-
-        if not suggestions:
-            await ctx.followup.send(
-                "Could not determine harmony suggestions — the palette may be mostly grayscale."
-            )
+        if not await _validate_image(ctx, image):
             return
+        _consume_cooldown(ctx.author.id)
+        try:
+            data = await image.read()
 
-        sugg_text = "\n".join(
-            f"`#{r:02X}{g:02X}{b:02X}` **{nearest_color_name((r,g,b))}** — {lbl}"
-            for (r, g, b), lbl in suggestions
-        )
+            def _work():
+                img = load_image_from_bytes(data)
+                colors, counts = extract_dominant_colors(img, n=num_colors)
+                palette_type, suggestions = suggest_harmony_colors(colors, counts)
+                if not suggestions:
+                    return palette_type, suggestions, None, None
+                orig_list = [tuple(int(v) for v in c) for c in colors]
+                harmony_buf = render_harmony_chart(orig_list, suggestions)
+                return palette_type, suggestions, orig_list, harmony_buf
 
-        embed = discord.Embed(
-            title=f"Harmony Suggestions — {image.filename}",
-            color=discord.Color.from_rgb(*orig_list[0]),
-        )
-        embed.add_field(name="Detected Palette Type", value=palette_type, inline=True)
-        embed.add_field(name="Suggested Colors", value=sugg_text, inline=False)
-        embed.set_image(url="attachment://harmony.png")
+            palette_type, suggestions, orig_list, harmony_buf = await _run_cpu(_work)
 
-        await ctx.followup.send(
-            embed=embed,
-            files=[discord.File(harmony_buf, filename="harmony.png")],
-        )
-    except Exception:
-        traceback.print_exc()
-        await ctx.followup.send("Something went wrong generating harmony suggestions.")
+            if not suggestions:
+                await ctx.followup.send(
+                    "Could not determine harmony suggestions — the palette may be mostly grayscale."
+                )
+                return
+
+            sugg_text = "\n".join(
+                f"`#{r:02X}{g:02X}{b:02X}` **{nearest_color_name((r,g,b))}** — {lbl}"
+                for (r, g, b), lbl in suggestions
+            )
+
+            embed = discord.Embed(
+                title=f"Harmony Suggestions — {image.filename}",
+                color=discord.Color.from_rgb(*orig_list[0]),
+            )
+            embed.add_field(name="Detected Palette Type", value=palette_type, inline=True)
+            embed.add_field(name="Suggested Colors", value=sugg_text, inline=False)
+            embed.set_image(url="attachment://harmony.png")
+
+            await ctx.followup.send(
+                embed=embed,
+                files=[discord.File(harmony_buf, filename="harmony.png")],
+            )
+        except Exception:
+            traceback.print_exc()
+            await ctx.followup.send("Something went wrong generating harmony suggestions.")
+    finally:
+        _release_heavy_slot()
 
 
 # ---------------------------------------------------------------------------
