@@ -44,6 +44,24 @@ class TestClassifyPaletteType:
             "Split Complementary", "Triadic", "Polychromatic",
         }
 
+    def test_tint_and_shade_of_matched_pair_still_split_complementary(self):
+        # GH #84: light red and dark red both have hue 0 (colorsys derives
+        # hue from the max/min channel ratio, so a tint/shade pair shares it
+        # exactly). a=light_red(hue 0), b=third(hue 170) match the
+        # complementary test (diff 170, within +-30 of 180). Excluding by
+        # hue *value* drops BOTH red swatches from the Split Complementary
+        # search, not just the matched light_red -- losing dark_red as a
+        # candidate (it's ~170 deg from b, within the +-30 tolerance of the
+        # 150 deg split-complementary angle) and misclassifying the whole
+        # palette as Complementary instead.
+        light_red = [255, 128, 128]  # hue 0
+        dark_red = [200, 100, 100]   # hue 0 (issue's own example)
+        third = np.array(
+            colorsys.hsv_to_rgb(170 / 360, 0.6, 0.8)
+        ) * 255                      # hue 170
+        colors = np.array([light_red, dark_red, third])
+        assert classify_palette_type(colors, _counts(3)) == "Split Complementary"
+
 
 class TestSuggestHarmonyColors:
     def test_returns_type_and_list(self):
