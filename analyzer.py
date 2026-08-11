@@ -413,10 +413,15 @@ def classify_palette_type(colors: np.ndarray, counts: np.ndarray) -> str:
     if max_spread < 60:
         return "Analogous"
 
+    # Exclude the matched pair by index, not by hue value: two distinct
+    # palette colors can carry the exact same hue when one is a tint or
+    # shade of the other, so a value-based filter can drop an unrelated
+    # third swatch instead of the two that were actually matched (GH #84).
     for i, a in enumerate(saturated_hues):
-        for b in saturated_hues[i + 1:]:
+        for j in range(i + 1, len(saturated_hues)):
+            b = saturated_hues[j]
             if abs(_circ_dist(a, b) - 180) <= 30:
-                others = [h for h in saturated_hues if h != a and h != b]
+                others = [h for k, h in enumerate(saturated_hues) if k not in (i, j)]
                 for c in others:
                     if abs(_circ_dist(a, c) - 150) <= 30 or abs(_circ_dist(b, c) - 150) <= 30:
                         return "Split Complementary"
@@ -424,10 +429,11 @@ def classify_palette_type(colors: np.ndarray, counts: np.ndarray) -> str:
 
     hues = sorted(saturated_hues)
     for i, a in enumerate(hues):
-        for b in hues[i + 1:]:
+        for j in range(i + 1, len(hues)):
+            b = hues[j]
             if abs(_circ_dist(a, b) - 120) <= 30:
-                for c in hues:
-                    if c != a and c != b:
+                for k, c in enumerate(hues):
+                    if k not in (i, j):
                         if abs(_circ_dist(b, c) - 120) <= 30 and abs(_circ_dist(a, c) - 120) <= 30:
                             return "Triadic"
 
