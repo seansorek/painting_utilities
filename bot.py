@@ -190,6 +190,22 @@ def _is_guild_admin(member: discord.Member) -> bool:
     return p.administrator or p.manage_guild
 
 
+def _resolve_guild_admin_member(guild: discord.Guild | None, user) -> discord.Member | None:
+    """Resolve `user`'s live guild Member, if they're a guild admin.
+
+    Prefers the guild's cached, live Member (fresher role/permission data
+    than an interaction's snapshot); falls back to `user` itself when it is
+    already a resolved Member. Returns None if the caller can't be resolved
+    or isn't an admin, so every caller of this helper fails closed.
+    """
+    member = guild.get_member(user.id) if guild else None
+    if not isinstance(member, discord.Member):
+        member = user if isinstance(user, discord.Member) else None
+    if member is not None and _is_guild_admin(member):
+        return member
+    return None
+
+
 async def _require_guild_admin(ctx: discord.ApplicationContext) -> bool:
     """Runtime enforcement for admin-only commands.
 
@@ -203,10 +219,7 @@ async def _require_guild_admin(ctx: discord.ApplicationContext) -> bool:
     used elsewhere in this bot) and returns False when the caller is not a
     guild admin. Returns True when authorized.
     """
-    member = ctx.guild.get_member(ctx.author.id) if ctx.guild else None
-    if not isinstance(member, discord.Member):
-        member = ctx.author if isinstance(ctx.author, discord.Member) else None
-    if member is not None and _is_guild_admin(member):
+    if _resolve_guild_admin_member(ctx.guild, ctx.author) is not None:
         return True
     message = "You need the **Manage Server** permission to use this command."
     if ctx.response.is_done():
@@ -2021,7 +2034,16 @@ async def daily_challenge(
 # ---------------------------------------------------------------------------
 
 async def _challenge_autocomplete(ctx: discord.AutocompleteContext) -> list[discord.OptionChoice]:
-    guild_id = str(ctx.interaction.guild_id)
+    interaction = ctx.interaction
+    # Discord can invoke autocomplete for a slash command a guild admin has
+    # exposed to non-admins via an overridden default_permissions, ahead of
+    # the runtime _require_guild_admin gate in the command callback itself.
+    # This callback returns pending-challenge day/time labels, which a
+    # non-admin should not be able to enumerate — fail closed with no
+    # choices rather than only relying on the callback's later check.
+    if _resolve_guild_admin_member(interaction.guild, interaction.user) is None:
+        return []
+    guild_id = str(interaction.guild_id)
     async with _SCHEDULE_LOCK:
         schedule = await asyncio.to_thread(_load_schedule)
     guild_challenges = sorted(

@@ -216,5 +216,60 @@ class TestAdminCommandsRejectNonAdmin:
         assert "permission" in msg.lower()
 
 
+class TestChallengeAutocompleteGuardsNonAdmin:
+    """Discord can invoke `_challenge_autocomplete` for a slash command a
+    guild admin has exposed to non-admins (via an overridden
+    default_permissions) before the command callback's own
+    _require_guild_admin gate ever runs. The autocomplete callback must
+    fail closed on its own rather than relying on that later check."""
+
+    def _make_autocomplete_ctx(self, member: MagicMock, guild_id: int = 1) -> MagicMock:
+        guild = MagicMock()
+        guild.get_member.return_value = member
+
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.guild = guild
+        interaction.guild_id = guild_id
+        interaction.user = member
+
+        ctx = MagicMock(spec=discord.AutocompleteContext)
+        ctx.interaction = interaction
+        ctx.value = ""
+        return ctx
+
+    def test_returns_no_choices_for_non_admin(self):
+        member = _make_member(is_admin=False, has_manage_guild=False)
+        ctx = self._make_autocomplete_ctx(member)
+        with patch.object(bot, "_load_schedule") as mock_load:
+            result = _run(bot._challenge_autocomplete(ctx))
+            mock_load.assert_not_called()
+        assert result == []
+
+    def test_returns_choices_for_admin(self):
+        member = _make_member(is_admin=False, has_manage_guild=True)
+        ctx = self._make_autocomplete_ctx(member)
+        with patch.object(bot, "_load_schedule", return_value=[]):
+            result = _run(bot._challenge_autocomplete(ctx))
+        assert result == []  # empty schedule, but the guard let it through
+
+    def test_unresolvable_member_returns_no_choices(self):
+        guild = MagicMock()
+        guild.get_member.return_value = None
+
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.guild = guild
+        interaction.guild_id = 1
+        interaction.user = MagicMock()  # not a discord.Member
+
+        ctx = MagicMock(spec=discord.AutocompleteContext)
+        ctx.interaction = interaction
+        ctx.value = ""
+
+        with patch.object(bot, "_load_schedule") as mock_load:
+            result = _run(bot._challenge_autocomplete(ctx))
+            mock_load.assert_not_called()
+        assert result == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
