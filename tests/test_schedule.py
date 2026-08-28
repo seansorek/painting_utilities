@@ -531,6 +531,74 @@ class TestPostScheduledChallengesTOCTOU(unittest.IsolatedAsyncioTestCase):
         self.assertIn("concurrent-2", saved_ids)
 
 
+class TestPostScheduledChallengesIssue78(unittest.IsolatedAsyncioTestCase):
+    """Issue #78: a malformed post_at on an ID-bearing entry must actually be
+    dropped in Phase 3, not re-written to disk forever.
+
+    Every entry created by /daily_challenge carries an `id`. Phase 1 logs and
+    skips malformed entries without recording their id anywhere, so Phase 3's
+    "not seen in Phase 1 -> concurrently added, keep it" branch used to fire
+    for them, making the entry permanently un-droppable.
+    """
+
+    async def asyncSetUp(self):
+        self._load_patch = patch.object(bot_module, "_load_schedule")
+        self._save_patch = patch.object(bot_module, "_save_schedule")
+        self.mock_load = self._load_patch.start()
+        self.mock_save = self._save_patch.start()
+
+    async def asyncTearDown(self):
+        self._load_patch.stop()
+        self._save_patch.stop()
+
+    async def test_malformed_post_at_with_id_is_actually_dropped(self):
+        """An ID-bearing entry with an unparseable post_at must be gone from
+        the saved schedule after a single tick, not re-persisted."""
+        bad_entry = {
+            "id": "bad-post-at-1",
+            "guild_id": "1",
+            "channel_id": "10",
+            "content": "malformed",
+            "post_at": "not-a-date",
+        }
+        # Phase 1 and Phase 3 both re-read from disk; nothing else is added
+        # concurrently, so the same entry is returned both times.
+        self.mock_load.return_value = [bad_entry]
+
+        await bot_module._post_scheduled_challenges()
+
+        saved = self.mock_save.call_args[0][0]
+        self.assertEqual(saved, [], "Malformed ID-bearing entry must be dropped, not kept forever")
+
+    async def test_malformed_post_at_with_id_dropped_alongside_other_entries(self):
+        """The malformed entry is dropped while unrelated entries are handled
+        normally (future entry kept, due entry sent and pruned)."""
+        bad_entry = {
+            "id": "bad-post-at-2",
+            "guild_id": "1",
+            "channel_id": "10",
+            "content": "malformed",
+            "post_at": "not-a-date",
+        }
+        future_entry = {
+            "id": "future-1",
+            "guild_id": "2",
+            "channel_id": "20",
+            "content": "later",
+            "post_at": _future_iso(2),
+        }
+        self.mock_load.return_value = [bad_entry, future_entry]
+
+        with patch.object(bot_module, "_send_daily_challenge", new=AsyncMock(return_value=True)):
+            await bot_module._post_scheduled_challenges()
+
+        saved = self.mock_save.call_args[0][0]
+        saved_ids = {c["id"] for c in saved}
+        self.assertNotIn("bad-post-at-2", saved_ids)
+        self.assertIn("future-1", saved_ids)
+        self.assertEqual(len(saved), 1)
+
+
 class TestScheduledLoopSurvivesBadChannelId(unittest.IsolatedAsyncioTestCase):
     """Issue #75: a malformed channel_id already on disk (e.g. from a legacy
     entry, or one that slipped past validation) must not crash the loop --
