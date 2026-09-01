@@ -5,7 +5,9 @@ from PIL import Image
 
 from analyzer import (
     apply_gradient_map,
+    extract_dominant_colors,
     GRADIENT_PRESETS,
+    palette_to_gradient_stops,
     render_gradient_preview,
 )
 from conftest import make_solid_image
@@ -41,6 +43,44 @@ class TestApplyGradientMap:
         img = make_solid_image((128, 128, 128), size=(8, 8))
         out = apply_gradient_map(img, GRADIENT_PRESETS["fire"])
         assert isinstance(out, Image.Image)
+
+    def test_single_stop_recolors_instead_of_black(self):
+        # Regression test for #86: a single-stop gradient must produce a
+        # flat recolour, not an all-black image (range(n - 1) == range(0)
+        # previously left the zero-initialized LUTs untouched).
+        img = make_solid_image((90, 40, 10), size=(6, 6))
+        stops = [(0.0, 120, 60, 200)]
+        out = apply_gradient_map(img, stops)
+        arr = np.array(out)
+        assert np.all(arr[:, :, 0] == 120)
+        assert np.all(arr[:, :, 1] == 60)
+        assert np.all(arr[:, :, 2] == 200)
+        assert out.getpixel((0, 0)) != (0, 0, 0)
+
+    def test_single_stop_position_other_than_zero(self):
+        img = make_solid_image((255, 255, 255), size=(4, 4))
+        stops = [(0.5, 7, 8, 9)]
+        out = apply_gradient_map(img, stops)
+        assert out.getpixel((0, 0)) == (7, 8, 9)
+
+    def test_empty_stops_raises(self):
+        img = make_solid_image((0, 0, 0), size=(4, 4))
+        with pytest.raises(ValueError):
+            apply_gradient_map(img, [])
+
+    def test_single_kmeans_cluster_end_to_end(self):
+        # Regression test for #86: a flat-colour upload yields a single
+        # surviving KMeans cluster (see extract_dominant_colors' counts > 0
+        # mask), producing a one-stop "gradient" that must not render black.
+        img = make_solid_image((120, 60, 200), size=(40, 40))
+        colors, counts = extract_dominant_colors(img, n=3)
+        assert len(colors) == 1
+        stops = palette_to_gradient_stops(colors, counts)
+        assert len(stops) == 1
+        out = apply_gradient_map(img, stops)
+        arr = np.array(out)
+        assert arr.max() > 0
+        assert tuple(int(c) for c in arr[0, 0]) == (120, 60, 200)
 
 
 class TestGradientPresets:
