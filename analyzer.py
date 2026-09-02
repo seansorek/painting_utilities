@@ -511,18 +511,26 @@ def apply_gradient_map(
     lut_g = np.zeros(256, dtype=np.uint8)
     lut_b = np.zeros(256, dtype=np.uint8)
     n = len(stops)
-    for i in range(256):
-        t = i / 255.0
-        for k in range(n - 1):
-            pos0, r0, g0, b0 = stops[k]
-            pos1, r1, g1, b1 = stops[k + 1]
-            if t <= pos1 or k == n - 2:
-                span = pos1 - pos0
-                local_t = 0.0 if span == 0 else max(0.0, min(1.0, (t - pos0) / span))
-                lut_r[i] = round(r0 + (r1 - r0) * local_t)
-                lut_g[i] = round(g0 + (g1 - g0) * local_t)
-                lut_b[i] = round(b0 + (b1 - b0) * local_t)
-                break
+    if n == 0:
+        raise ValueError("apply_gradient_map needs at least one gradient stop")
+    if n == 1:
+        _, r, g, b = stops[0]
+        lut_r[:] = r
+        lut_g[:] = g
+        lut_b[:] = b
+    else:
+        for i in range(256):
+            t = i / 255.0
+            for k in range(n - 1):
+                pos0, r0, g0, b0 = stops[k]
+                pos1, r1, g1, b1 = stops[k + 1]
+                if t <= pos1 or k == n - 2:
+                    span = pos1 - pos0
+                    local_t = 0.0 if span == 0 else max(0.0, min(1.0, (t - pos0) / span))
+                    lut_r[i] = round(r0 + (r1 - r0) * local_t)
+                    lut_g[i] = round(g0 + (g1 - g0) * local_t)
+                    lut_b[i] = round(b0 + (b1 - b0) * local_t)
+                    break
     arr = np.array(img, dtype=np.float32)
     lum = (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]).astype(np.uint8)
     out = np.stack([lut_r[lum], lut_g[lum], lut_b[lum]], axis=-1)
