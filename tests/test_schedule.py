@@ -904,5 +904,68 @@ class TestDailyChallengeChannelIdValidation(unittest.IsolatedAsyncioTestCase):
         self.assertIn("scheduled", msg)
 
 
+class TestDailyChallengeThreadNameLimitScopedToForum(unittest.IsolatedAsyncioTestCase):
+    """Issue #88 follow-up: the thread-name-length guard must only apply
+    when the destination channel is a ForumChannel. `_send_daily_challenge`
+    uses `channel.send()` for anything else (a same-guild text channel),
+    where Discord's thread-name limit is irrelevant -- the original
+    unconditional guard rejected otherwise-deliverable challenges there.
+    """
+
+    # 20-char prefix ("[ DAILY GESTURE ] — ") + 81 pushes the name to 101.
+    LONG_DAY = "x" * 81
+
+    # Same ctx/admin-gate wiring as TestDailyChallengeChannelIdValidation
+    # (see the comment there for why bot_module.discord.Member is used as
+    # the spec instead of _discord_stub.Member).
+    _make_ctx = TestDailyChallengeChannelIdValidation._make_ctx
+    _option_defaults = staticmethod(TestDailyChallengeChannelIdValidation._option_defaults)
+    asyncSetUp = TestDailyChallengeChannelIdValidation.asyncSetUp
+    asyncTearDown = TestDailyChallengeChannelIdValidation.asyncTearDown
+
+    async def test_long_day_rejected_when_channel_is_forum(self):
+        ctx = self._make_ctx(guild_id=42)
+        same_guild = MagicMock()
+        same_guild.id = 42
+        # bot_module.discord.ForumChannel, not _discord_stub.ForumChannel:
+        # if an earlier-collected test module imported the real `discord`
+        # package first, bot.py's own `isinstance(..., discord.ForumChannel)`
+        # check runs against the real class, and a mock spec'd to this
+        # file's local stub class would never satisfy it.
+        forum_channel = AsyncMock(spec=bot_module.discord.ForumChannel)
+        forum_channel.guild = same_guild
+
+        with patch.object(bot_module.bot, "get_channel", return_value=forum_channel), \
+             patch.object(bot_module, "_load_references", return_value=[]), \
+             patch.object(bot_module, "_parse_release_datetime", return_value=_future_iso(1)):
+            await bot_module.daily_challenge(
+                ctx, day=self.LONG_DAY, channel_id="123", **self._option_defaults(),
+            )
+
+        ctx.followup.send.assert_awaited_once()
+        (msg,), kwargs = ctx.followup.send.call_args
+        self.assertIn("Thread name would be", msg)
+        self.mock_save.assert_not_called()
+
+    async def test_long_day_accepted_when_channel_is_plain_text(self):
+        ctx = self._make_ctx(guild_id=42)
+        same_guild = MagicMock()
+        same_guild.id = 42
+        text_channel = MagicMock()  # deliberately NOT spec'd as ForumChannel
+        text_channel.guild = same_guild
+
+        with patch.object(bot_module.bot, "get_channel", return_value=text_channel), \
+             patch.object(bot_module, "_load_references", return_value=[]), \
+             patch.object(bot_module, "_parse_release_datetime", return_value=_future_iso(1)):
+            await bot_module.daily_challenge(
+                ctx, day=self.LONG_DAY, channel_id="123", **self._option_defaults(),
+            )
+
+        self.mock_save.assert_called_once()
+        saved = self.mock_save.call_args[0][0]
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["day"], self.LONG_DAY)
+
+
 if __name__ == "__main__":
     unittest.main()

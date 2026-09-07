@@ -2053,6 +2053,7 @@ async def daily_challenge(
     if not await _require_guild_admin(ctx):
         return
 
+    target_channel = None
     if channel_id:
         if not channel_id.isdigit():
             await ctx.followup.send(
@@ -2078,6 +2079,7 @@ async def daily_challenge(
                 ephemeral=True,
             )
             return
+        target_channel = resolved_channel
 
     try:
         post_at_iso = _parse_release_datetime(release_time, release_date)
@@ -2106,6 +2108,7 @@ async def daily_challenge(
                 ephemeral=True,
             )
             return
+        target_channel = bot.get_channel(int(default_channel_id))
 
     challenge = {
         "id":              str(uuid.uuid4()),
@@ -2130,15 +2133,21 @@ async def daily_challenge(
         )
         return
 
-    thread_name_len = len(_thread_name_for(challenge))
-    if thread_name_len > DISCORD_THREAD_NAME_LIMIT:
-        await ctx.followup.send(
-            f"Thread name would be {thread_name_len} characters, exceeding "
-            f"Discord's {DISCORD_THREAD_NAME_LIMIT}-char limit. Shorten `day` "
-            f"and try again.",
-            ephemeral=True,
-        )
-        return
+    # _send_daily_challenge only creates a thread (and is bound by Discord's
+    # thread-name limit) when the destination is a ForumChannel -- a
+    # same-guild text channel gets a plain channel.send() instead, so the
+    # limit doesn't apply there and would otherwise reject an otherwise
+    # deliverable challenge.
+    if isinstance(target_channel, discord.ForumChannel):
+        thread_name_len = len(_thread_name_for(challenge))
+        if thread_name_len > DISCORD_THREAD_NAME_LIMIT:
+            await ctx.followup.send(
+                f"Thread name would be {thread_name_len} characters, exceeding "
+                f"Discord's {DISCORD_THREAD_NAME_LIMIT}-char limit. Shorten `day` "
+                f"and try again.",
+                ephemeral=True,
+            )
+            return
 
     async with _SCHEDULE_LOCK:
         schedule = await asyncio.to_thread(_load_schedule)
@@ -2384,15 +2393,22 @@ async def edit_challenge(
             )
             return
 
-        thread_name_len = len(_thread_name_for(target))
-        if thread_name_len > DISCORD_THREAD_NAME_LIMIT:
-            await ctx.followup.send(
-                f"Thread name would be {thread_name_len} characters, exceeding "
-                f"Discord's {DISCORD_THREAD_NAME_LIMIT}-char limit. Shorten "
-                f"`new_day` and try again.",
-                ephemeral=True,
-            )
-            return
+        # Same as /daily_challenge: the limit only applies when the
+        # destination resolves to a ForumChannel (_send_daily_challenge
+        # creates a thread there; a plain text channel gets channel.send()
+        # and has no thread name at all).
+        target_channel_id = target.get("channel_id") or _get_guild_channel(ctx.guild_id)
+        target_channel = bot.get_channel(int(target_channel_id)) if target_channel_id else None
+        if isinstance(target_channel, discord.ForumChannel):
+            thread_name_len = len(_thread_name_for(target))
+            if thread_name_len > DISCORD_THREAD_NAME_LIMIT:
+                await ctx.followup.send(
+                    f"Thread name would be {thread_name_len} characters, exceeding "
+                    f"Discord's {DISCORD_THREAD_NAME_LIMIT}-char limit. Shorten "
+                    f"`new_day` and try again.",
+                    ephemeral=True,
+                )
+                return
 
         await asyncio.to_thread(_save_schedule, schedule)
 
