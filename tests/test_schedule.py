@@ -446,6 +446,27 @@ class TestSendDailyChallenge(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result)
 
 
+class TestThreadNameFor(unittest.TestCase):
+    """Issue #88: thread names must respect Discord's 100-char limit."""
+
+    def test_default_name_when_no_day(self):
+        self.assertEqual(bot_module._thread_name_for({}), "[ DAILY GESTURE ]")
+
+    def test_name_includes_day(self):
+        name = bot_module._thread_name_for({"day": "Day 42"})
+        self.assertEqual(name, "[ DAILY GESTURE ] — Day 42")
+
+    def test_long_day_exceeds_thread_name_limit(self):
+        day = "x" * 81  # prefix is 20 chars, so 81 pushes the name to 101
+        name = bot_module._thread_name_for({"day": day})
+        self.assertGreater(len(name), bot_module.DISCORD_THREAD_NAME_LIMIT)
+
+    def test_day_at_limit_fits(self):
+        day = "x" * 80
+        name = bot_module._thread_name_for({"day": day})
+        self.assertEqual(len(name), bot_module.DISCORD_THREAD_NAME_LIMIT)
+
+
 class TestPostScheduledChallengesTOCTOU(unittest.IsolatedAsyncioTestCase):
     """Issue #46: concurrent additions during Phase 2 must not be lost.
 

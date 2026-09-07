@@ -1774,6 +1774,12 @@ def _random_minimum_time() -> str:
 
 
 DISCORD_CONTENT_LIMIT = 2000
+DISCORD_THREAD_NAME_LIMIT = 100
+
+
+def _thread_name_for(challenge: dict) -> str:
+    day = challenge.get("day", "")
+    return f"[ DAILY GESTURE ] — {day}" if day else "[ DAILY GESTURE ]"
 
 
 def _format_daily_post(challenge: dict) -> str:
@@ -1829,8 +1835,7 @@ async def _send_daily_challenge(challenge: dict) -> bool:
             print(f"Daily challenge: channel {channel_id} not found for guild {guild_id}.")
             return False
         content = _format_daily_post(challenge)
-        day = challenge.get("day", "")
-        thread_name = f"[ DAILY GESTURE ] — {day}" if day else "[ DAILY GESTURE ]"
+        thread_name = _thread_name_for(challenge)
         daily_role_id = _get_guild_daily_role(int(guild_id))
         allowed = discord.AllowedMentions(
             everyone=False,
@@ -2125,6 +2130,16 @@ async def daily_challenge(
         )
         return
 
+    thread_name_len = len(_thread_name_for(challenge))
+    if thread_name_len > DISCORD_THREAD_NAME_LIMIT:
+        await ctx.followup.send(
+            f"Thread name would be {thread_name_len} characters, exceeding "
+            f"Discord's {DISCORD_THREAD_NAME_LIMIT}-char limit. Shorten `day` "
+            f"and try again.",
+            ephemeral=True,
+        )
+        return
+
     async with _SCHEDULE_LOCK:
         schedule = await asyncio.to_thread(_load_schedule)
         schedule.append(challenge)
@@ -2365,6 +2380,16 @@ async def edit_challenge(
                 f"Combined post is {rendered_len} characters, exceeding Discord's "
                 f"{DISCORD_CONTENT_LIMIT}-char limit. Shorten the reference, "
                 f"extra_challenge, or other fields and try again.",
+                ephemeral=True,
+            )
+            return
+
+        thread_name_len = len(_thread_name_for(target))
+        if thread_name_len > DISCORD_THREAD_NAME_LIMIT:
+            await ctx.followup.send(
+                f"Thread name would be {thread_name_len} characters, exceeding "
+                f"Discord's {DISCORD_THREAD_NAME_LIMIT}-char limit. Shorten "
+                f"`new_day` and try again.",
                 ephemeral=True,
             )
             return
